@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
-import { BookOpen, FileText, Users, Target, ArrowRight, TrendingUp, CheckCircle, Clock } from 'lucide-react'
+import { BookOpen, FileText, Users, Target, ArrowRight } from 'lucide-react'
 import { getDashboardStats, getCourses } from '../api'
 import { useAuth } from '../contexts/AuthContext'
 
@@ -41,35 +41,35 @@ export default function Dashboard() {
   ]
 
   return (
-    <div className="p-8 max-w-6xl mx-auto">
+    <div className="p-4 md:p-8 max-w-6xl mx-auto">
       {/* Header */}
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-gray-900">
+      <div className="mb-6 md:mb-8">
+        <h1 className="text-xl md:text-2xl font-bold text-gray-900">
           Welcome back, {user?.name?.split(' ')[0]} 👋
         </h1>
-        <p className="text-gray-500 mt-1">
+        <p className="text-gray-500 mt-1 text-sm md:text-base">
           {new Date().toLocaleDateString('en-SA', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
         </p>
       </div>
 
       {/* Workflow banner */}
-      <div className="bg-gradient-to-r from-indigo-600 to-violet-600 rounded-2xl p-6 text-white mb-8">
-        <h2 className="text-lg font-semibold mb-3">FCAR Workflow</h2>
-        <div className="flex items-center gap-3 flex-wrap">
+      <div className="bg-gradient-to-r from-indigo-600 to-violet-600 rounded-2xl p-4 md:p-6 text-white mb-6 md:mb-8">
+        <h2 className="text-base md:text-lg font-semibold mb-3">FCAR Workflow</h2>
+        <div className="flex items-center gap-2 flex-wrap">
           {['Upload Evidence', 'Define CLOs', 'Map to NCAAA', 'Enter Grades', 'Calculate Attainment', 'View Report'].map((step, i, arr) => (
-            <div key={step} className="flex items-center gap-3">
-              <div className="flex items-center gap-2 bg-white/20 px-3 py-1.5 rounded-full text-sm">
-                <span className="w-5 h-5 bg-white/30 rounded-full text-xs flex items-center justify-center font-bold">{i + 1}</span>
+            <div key={step} className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 bg-white/20 px-2.5 py-1 md:px-3 md:py-1.5 rounded-full text-xs md:text-sm">
+                <span className="w-4 h-4 md:w-5 md:h-5 bg-white/30 rounded-full text-xs flex items-center justify-center font-bold shrink-0">{i + 1}</span>
                 {step}
               </div>
-              {i < arr.length - 1 && <ArrowRight size={14} className="text-white/60 shrink-0" />}
+              {i < arr.length - 1 && <ArrowRight size={12} className="text-white/60 shrink-0 hidden sm:block" />}
             </div>
           ))}
         </div>
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-6 md:mb-8">
         {statCards.map(c => <StatCard key={c.label} {...c} />)}
       </div>
 
