@@ -1,129 +1,318 @@
 import { useState, useEffect } from 'react'
-import { Link } from 'react-router-dom'
-import { Plus, BookOpen, Trash2, X, ChevronRight, ChevronDown, ChevronUp } from 'lucide-react'
-import { getCourses, createCourse, deleteCourse } from '../api'
-import { DEPARTMENTS } from '../constants'
+import { Link, useNavigate } from 'react-router-dom'
+import { Plus, BookOpen, Trash2, X, ChevronRight, ChevronDown, ChevronUp, AlertCircle } from 'lucide-react'
+import {
+  getCourses, createCourse, deleteCourse,
+  getCLOTemplateByCode, copyCLOsToNewCourse, checkCourseDuplicate,
+} from '../api'
+import { PREDEFINED_COURSES } from '../constants/courses'
 
 const SEMESTERS    = ['Fall', 'Spring', 'Summer']
 const CURRENT_YEAR = new Date().getFullYear()
-const YEARS        = Array.from({ length: 5 }, (_, i) => CURRENT_YEAR - 2 + i)
+const YEARS        = Array.from({ length: 6 }, (_, i) => 2024 + i)
+const YEAR_ORDER   = ['Freshman', 'Sophomore', 'Junior', 'Senior']
 
-const EMPTY = {
-  code: '', name: '', credit_hours: 3,
-  department: DEPARTMENTS[0], semester: 'Fall', year: CURRENT_YEAR, description: '',
+// ── Year-level section labels ─────────────────────────────────────────────────
+
+const YEAR_LABELS = {
+  'Freshman':  '🎓 Freshman Year',
+  'Sophomore': '📚 Sophomore Year',
+  'Junior':    '🔬 Junior Year',
+  'Senior':    '🏆 Senior Year',
 }
+
+function getCourseYearLabel(code) {
+  const match = code.match(/\d+/)
+  if (!match) return 'Other'
+  const num = parseInt(match[0])
+  if (num >= 100 && num < 200) return YEAR_LABELS['Freshman']
+  if (num >= 200 && num < 300) return YEAR_LABELS['Sophomore']
+  if (num >= 300 && num < 400) return YEAR_LABELS['Junior']
+  if (num >= 400 && num < 500) return YEAR_LABELS['Senior']
+  return 'Other'
+}
+
+const ORDERED_YEAR_LABELS = [...Object.values(YEAR_LABELS), 'Other']
 
 // ── Course creation modal ─────────────────────────────────────────────────────
 
-function CourseModal({ onSave, onClose }) {
-  const [form, setForm]       = useState(EMPTY)
-  const [loading, setLoading] = useState(false)
-  const [error, setError]     = useState('')
+function CourseModal({ onClose }) {
+  const navigate = useNavigate()
 
-  const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target.value }))
+  const [selectedCourse, setSelectedCourse] = useState(null)
+  const [semester,       setSemester]        = useState('Fall')
+  const [year,           setYear]            = useState(CURRENT_YEAR)
+  const [description,    setDescription]     = useState('')
+  const [templateCLOs,   setTemplateCLOs]    = useState(null)  // null = not yet fetched
+  const [loadingCLOs,    setLoadingCLOs]     = useState(false)
+  const [saving,         setSaving]          = useState(false)
+  const [savingText,     setSavingText]       = useState('')
+  const [error,          setError]           = useState('')
 
-  const handleSubmit = async (e) => {
-    e.preventDefault()
+  // Group predefined courses by year level for the optgroup dropdown
+  const groupedCourses = YEAR_ORDER.reduce((acc, yl) => {
+    acc[yl] = PREDEFINED_COURSES.filter(c => c.year_level === yl)
+    return acc
+  }, {})
+
+  const handleCourseChange = async (e) => {
+    const code = e.target.value
     setError('')
-    setLoading(true)
+
+    if (!code) {
+      setSelectedCourse(null)
+      setTemplateCLOs(null)
+      return
+    }
+
+    const course = PREDEFINED_COURSES.find(c => c.code === code)
+    setSelectedCourse(course || null)
+    if (!course) return
+
+    setLoadingCLOs(true)
+    setTemplateCLOs(null)
     try {
-      await onSave({ ...form, credit_hours: Number(form.credit_hours), year: Number(form.year) })
+      const { data } = await getCLOTemplateByCode(code)
+      setTemplateCLOs(data)
+    } catch {
+      setTemplateCLOs([])
+    } finally {
+      setLoadingCLOs(false)
+    }
+  }
+
+  const handleSave = async () => {
+    if (!selectedCourse || saving) return
+    setError('')
+    setSaving(true)
+
+    try {
+      // Step A — duplicate check
+      const isDuplicate = await checkCourseDuplicate(selectedCourse.code, semester, Number(year))
+      if (isDuplicate) {
+        setError(
+          `${selectedCourse.code} already exists for ${semester} ${year}. ` +
+          `Each course can only be added once per semester.`
+        )
+        return
+      }
+
+      // Step B — create the course row
+      setSavingText(
+        templateCLOs?.length > 0
+          ? 'Creating course and loading CLOs...'
+          : 'Creating course...'
+      )
+      const { data: newCourse } = await createCourse({
+        code:         selectedCourse.code,
+        name:         selectedCourse.name,
+        department:   selectedCourse.department,
+        credit_hours: selectedCourse.credit_hours,
+        semester,
+        year:         Number(year),
+        description:  description || null,
+      })
+
+      // Step C — copy CLO templates into the new course
+      if (templateCLOs?.length > 0) {
+        await copyCLOsToNewCourse(newCourse.id, templateCLOs)
+      }
+
+      // Step D — redirect to the new course detail page
+      navigate(`/courses/${newCourse.id}`)
       onClose()
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to save course')
+      setError(err.response?.data?.detail || 'Failed to create course')
     } finally {
-      setLoading(false)
+      setSaving(false)
+      setSavingText('')
     }
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
-        <div className="flex items-center justify-between px-6 py-4 border-b">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col">
+
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b shrink-0">
           <h3 className="font-semibold text-gray-900">New Course</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600" disabled={saving}>
+            <X size={20} />
+          </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
-          {error && <div className="bg-red-50 text-red-700 text-sm rounded-lg px-3 py-2">{error}</div>}
+        {/* Body */}
+        <div className="overflow-y-auto p-6 space-y-5">
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="label">Course Code *</label>
-              <input required className="input" placeholder="SE495"
-                value={form.code} onChange={set('code')} />
+          {/* Error banner */}
+          {error && (
+            <div className="bg-red-50 text-red-700 text-sm rounded-lg px-3 py-2 flex items-start gap-2">
+              <AlertCircle size={15} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
             </div>
-            <div>
-              <label className="label">Credit Hours</label>
-              <input type="number" min={1} max={6} className="input"
-                value={form.credit_hours} onChange={set('credit_hours')} />
-            </div>
-          </div>
+          )}
 
+          {/* Course dropdown */}
           <div>
-            <label className="label">Course Name *</label>
-            <input required className="input" placeholder="Software Engineering Capstone"
-              value={form.name} onChange={set('name')} />
-          </div>
-
-          <div>
-            <label className="label">Department *</label>
-            <select required className="input" value={form.department} onChange={set('department')}>
-              {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+            <label className="label">Select Course *</label>
+            <select
+              className="input"
+              value={selectedCourse?.code || ''}
+              onChange={handleCourseChange}
+              disabled={saving}
+            >
+              <option value="">— Choose a course —</option>
+              {YEAR_ORDER.map(yl => (
+                <optgroup key={yl} label={`${yl} Year`}>
+                  {groupedCourses[yl].map(c => (
+                    <option key={c.code} value={c.code}>
+                      {c.code} — {c.name}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
             </select>
           </div>
 
+          {/* Read-only course details */}
+          {selectedCourse && (
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 space-y-3">
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <p className="label">Course Code</p>
+                  <p className="text-sm font-mono font-semibold text-gray-900">{selectedCourse.code}</p>
+                </div>
+                <div>
+                  <p className="label">Department</p>
+                  <p className="text-sm text-gray-900">{selectedCourse.department}</p>
+                </div>
+                <div>
+                  <p className="label">Credit Hours</p>
+                  <p className="text-sm text-gray-900">{selectedCourse.credit_hours}</p>
+                </div>
+              </div>
+              <div>
+                <p className="label">Course Name</p>
+                <p className="text-sm text-gray-900">{selectedCourse.name}</p>
+              </div>
+            </div>
+          )}
+
+          {/* CLO preview / info */}
+          {selectedCourse && (
+            <>
+              {loadingCLOs && (
+                <div className="bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2 text-sm text-indigo-600">
+                  Loading CLO template…
+                </div>
+              )}
+
+              {!loadingCLOs && templateCLOs !== null && templateCLOs.length > 0 && (
+                <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 space-y-2">
+                  <p className="text-xs font-semibold text-blue-700 uppercase tracking-wide">
+                    CLOs will be automatically loaded from the database for this course
+                  </p>
+                  <ul className="space-y-1.5 mt-1">
+                    {templateCLOs.map(clo => (
+                      <li key={clo.id} className="flex gap-2 text-xs">
+                        <span className="font-mono font-semibold text-blue-700 shrink-0 w-10">{clo.code}</span>
+                        <span className="text-blue-600 line-clamp-1">{clo.description}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {!loadingCLOs && templateCLOs !== null && templateCLOs.length === 0 && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-sm text-amber-700">
+                  No CLO template found for this course yet. CLOs can be added manually after creation.
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Semester + Year */}
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="label">Semester</label>
-              <select className="input" value={form.semester} onChange={set('semester')}>
+              <label className="label">Semester *</label>
+              <select
+                className="input"
+                value={semester}
+                onChange={e => setSemester(e.target.value)}
+                disabled={saving}
+              >
                 {SEMESTERS.map(s => <option key={s}>{s}</option>)}
               </select>
             </div>
             <div>
-              <label className="label">Year</label>
-              <select className="input" value={form.year} onChange={set('year')}>
+              <label className="label">Year *</label>
+              <select
+                className="input"
+                value={year}
+                onChange={e => setYear(e.target.value)}
+                disabled={saving}
+              >
                 {YEARS.map(y => <option key={y}>{y}</option>)}
               </select>
             </div>
           </div>
 
+          {/* Description */}
           <div>
             <label className="label">Description</label>
-            <textarea className="input" rows={2} placeholder="Optional…"
-              value={form.description} onChange={set('description')} />
+            <textarea
+              className="input"
+              rows={2}
+              placeholder="Optional…"
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+              disabled={saving}
+            />
           </div>
+        </div>
 
-          <p className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2">
-            CLOs will be auto-populated based on the selected department when the course is created.
-          </p>
-
-          <div className="flex justify-end gap-3 pt-2">
-            <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
-            <button type="submit" disabled={loading} className="btn-primary">
-              {loading ? 'Creating…' : 'Create Course'}
-            </button>
-          </div>
-        </form>
+        {/* Footer */}
+        <div className="flex justify-end gap-3 px-6 py-4 border-t shrink-0">
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn-secondary"
+            disabled={saving}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={!selectedCourse || saving}
+            className="btn-primary flex items-center gap-2"
+          >
+            {saving ? (
+              <>
+                <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                {savingText || 'Creating…'}
+              </>
+            ) : 'Save Course'}
+          </button>
+        </div>
       </div>
     </div>
   )
 }
 
-// ── Collapsible department section ────────────────────────────────────────────
+// ── Collapsible year-level section ────────────────────────────────────────────
 
-function DeptSection({ dept, courses, onDelete, deleting }) {
+function YearSection({ label, courses, onDelete, deleting }) {
   const [open, setOpen] = useState(true)
 
   return (
     <div className="border border-gray-100 rounded-2xl overflow-hidden">
-      {/* Section header */}
       <button
         onClick={() => setOpen(o => !o)}
         className="w-full flex items-center justify-between px-5 py-3 bg-gray-50 hover:bg-gray-100 transition-colors"
       >
         <div className="flex items-center gap-2">
-          <span className="font-semibold text-gray-800">{dept}</span>
+          <span className="font-semibold text-gray-800">{label}</span>
           <span className="text-xs bg-indigo-100 text-indigo-700 rounded-full px-2 py-0.5 font-medium">
             {courses.length} course{courses.length !== 1 ? 's' : ''}
           </span>
@@ -133,13 +322,15 @@ function DeptSection({ dept, courses, onDelete, deleting }) {
           : <ChevronDown size={16} className="text-gray-400" />}
       </button>
 
-      {/* Course rows */}
       {open && (
         <div className="divide-y divide-gray-50">
           {courses.map(c => (
-            <div key={c.id} className="flex items-center gap-4 px-5 py-4 bg-white hover:bg-gray-50/60 transition-colors">
+            <div
+              key={c.id}
+              className="flex items-center gap-4 px-5 py-4 bg-white hover:bg-gray-50/60 transition-colors"
+            >
               <div className="w-10 h-10 bg-indigo-100 text-indigo-700 rounded-xl flex items-center justify-center font-bold text-xs shrink-0">
-                {c.code.slice(0, 2)}
+                {c.code.replace(/\s/, '').slice(0, 4)}
               </div>
               <div className="flex-1 min-w-0">
                 <p className="font-semibold text-gray-900 text-sm">{c.code} — {c.name}</p>
@@ -171,18 +362,15 @@ function DeptSection({ dept, courses, onDelete, deleting }) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Courses() {
-  const [courses, setCourses] = useState([])
-  const [loading, setLoading] = useState(true)
+  const [courses,   setCourses]   = useState([])
+  const [loading,   setLoading]   = useState(true)
   const [showModal, setShowModal] = useState(false)
-  const [deleting, setDeleting]  = useState(null)
+  const [deleting,  setDeleting]  = useState(null)
 
-  const load = () => getCourses().then(r => setCourses(r.data)).finally(() => setLoading(false))
+  const load = () =>
+    getCourses().then(r => setCourses(r.data)).finally(() => setLoading(false))
+
   useEffect(() => { load() }, [])
-
-  const handleCreate = async (data) => {
-    await createCourse(data)
-    load()
-  }
 
   const handleDelete = async (id) => {
     if (!confirm('Delete this course and all its data? This cannot be undone.')) return
@@ -192,17 +380,15 @@ export default function Courses() {
     setDeleting(null)
   }
 
-  // Group courses by department (preserving DEPARTMENTS order)
+  // Group by year level derived from course code number
   const grouped = {}
-  DEPARTMENTS.forEach(d => { grouped[d] = [] })
+  ORDERED_YEAR_LABELS.forEach(lbl => { grouped[lbl] = [] })
   courses.forEach(c => {
-    if (grouped[c.department] !== undefined) grouped[c.department].push(c)
-    else {
-      grouped['Other'] = grouped['Other'] || []
-      grouped['Other'].push(c)
-    }
+    const lbl = getCourseYearLabel(c.code)
+    if (!grouped[lbl]) grouped[lbl] = []
+    grouped[lbl].push(c)
   })
-  const activeDepts = [...DEPARTMENTS, 'Other'].filter(d => grouped[d]?.length > 0)
+  const activeLabels = ORDERED_YEAR_LABELS.filter(lbl => grouped[lbl]?.length > 0)
 
   return (
     <div className="p-8 max-w-5xl mx-auto">
@@ -237,11 +423,11 @@ export default function Courses() {
         </div>
       ) : (
         <div className="space-y-4">
-          {activeDepts.map(dept => (
-            <DeptSection
-              key={dept}
-              dept={dept}
-              courses={grouped[dept]}
+          {activeLabels.map(lbl => (
+            <YearSection
+              key={lbl}
+              label={lbl}
+              courses={grouped[lbl]}
               onDelete={handleDelete}
               deleting={deleting}
             />
@@ -250,7 +436,7 @@ export default function Courses() {
       )}
 
       {showModal && (
-        <CourseModal onSave={handleCreate} onClose={() => setShowModal(false)} />
+        <CourseModal onClose={() => setShowModal(false)} />
       )}
     </div>
   )

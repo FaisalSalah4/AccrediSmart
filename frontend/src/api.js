@@ -6,7 +6,6 @@
  */
 
 import { supabase } from './lib/supabase'
-import { DEPT_CLOS } from './constants'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -84,13 +83,6 @@ export const createCourse = async (courseData) => {
     .insert({ ...courseData, instructor_id: id })
     .select().single()
   if (error) raise(error)
-
-  // Auto-populate CLOs based on department
-  const template = DEPT_CLOS[courseData.department] || DEPT_CLOS.DEFAULT
-  const cloRows  = template.map(c => ({ ...c, course_id: data.id }))
-  const { error: cloErr } = await supabase.from('clos').insert(cloRows)
-  if (cloErr) raise(cloErr)
-
   return { data }
 }
 
@@ -183,4 +175,66 @@ export const updateCLO = async (cloId, cloData) => {
     .from('clos').update(cloData).eq('id', cloId).select().single()
   if (error) raise(error)
   return { data }
+}
+
+// ── Course CLO templates ───────────────────────────────────────────────────────
+
+/** Fetch CLOs from any existing course that matches the given course code — used as template source */
+export const getCLOTemplateByCode = async (courseCode) => {
+  const { data: existingCourses, error: courseError } = await supabase
+    .from('courses')
+    .select('id')
+    .eq('code', courseCode)
+    .limit(1)
+
+  if (courseError || !existingCourses?.length) return { data: [] }
+
+  const { data, error } = await supabase
+    .from('clos')
+    .select('*')
+    .eq('course_id', existingCourses[0].id)
+    .order('code', { ascending: true })
+
+  if (error) raise(error)
+  return { data }
+}
+
+/** Copy CLO templates into a newly created course */
+export const copyCLOsToNewCourse = async (newCourseId, templateCLOs) => {
+  if (!templateCLOs || templateCLOs.length === 0) return { data: [] }
+
+  const newCLOs = templateCLOs.map(clo => ({
+    course_id:         newCourseId,
+    code:              clo.code,
+    description:       clo.description,
+    ncaaa_domain:      clo.ncaaa_domain,
+    bloom_level:       clo.bloom_level,
+    target_attainment: clo.target_attainment,
+    passing_score:     clo.passing_score,
+    plo_mapping:       clo.plo_mapping,
+    so_mapping:        clo.so_mapping,
+  }))
+
+  const { data, error } = await supabase
+    .from('clos')
+    .insert(newCLOs)
+    .select()
+
+  if (error) raise(error)
+  return { data }
+}
+
+/** Returns true if the current instructor already has this course code in the given semester/year */
+export const checkCourseDuplicate = async (code, semester, year) => {
+  const id = await uid()
+  const { data, error } = await supabase
+    .from('courses')
+    .select('id')
+    .eq('code', code)
+    .eq('semester', semester)
+    .eq('year', year)
+    .eq('instructor_id', id)
+    .limit(1)
+  if (error) raise(error)
+  return (data?.length ?? 0) > 0
 }
