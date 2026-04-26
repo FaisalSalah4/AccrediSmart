@@ -1,6 +1,17 @@
 // ── Departments ───────────────────────────────────────────────────────────────
 export const DEPARTMENTS = ['SE', 'CS', 'IS', 'CE', 'EE', 'ME', 'IE', 'MATH', 'PHYS', 'CHEM']
 
+// ── Assessment types (FCAR workflow) ─────────────────────────────────────────
+export const ASSESSMENT_TYPES = [
+  'Quiz',
+  'Assignment',
+  'Midterm',
+  'Final Exam',
+  'Project',
+  'Lab',
+  'Presentation',
+]
+
 // ── Evidence file categories (UG Course Portfolio template) ───────────────────
 export const EVIDENCE_TYPES = [
   { value: 'course_specification', label: 'Course Specification'                      },
