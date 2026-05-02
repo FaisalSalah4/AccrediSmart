@@ -90,6 +90,32 @@ const fileSize = (bytes) => {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
+/** Small pill that shows current save state for the grades grid */
+function SaveStatusBadge({ status, dirtyCount, errorMsg }) {
+  if (status === 'saving') {
+    return <span className="text-xs text-indigo-600 flex items-center gap-1">
+      <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-pulse" /> Saving…
+    </span>
+  }
+  if (status === 'saved') {
+    return <span className="text-xs text-green-600 flex items-center gap-1">
+      <CheckCircle size={12} /> Saved
+    </span>
+  }
+  if (status === 'error') {
+    return <span className="text-xs text-red-600 flex items-center gap-1" title={errorMsg}>
+      <AlertCircle size={12} /> Failed{errorMsg ? ` — ${errorMsg}` : ''}
+    </span>
+  }
+  if (status === 'dirty' || dirtyCount > 0) {
+    return <span className="text-xs text-amber-600 flex items-center gap-1">
+      <span className="w-1.5 h-1.5 bg-amber-500 rounded-full" />
+      {dirtyCount} unsaved change{dirtyCount === 1 ? '' : 's'}
+    </span>
+  }
+  return null
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // TAB: OVERVIEW
 // ════════════════════════════════════════════════════════════════════════════
@@ -397,6 +423,25 @@ function CLOsTab({ courseId }) {
         <strong>Target Attainment</strong> (60–90%) and <strong>Passing Score</strong> (50–80%).
         All other fields are fixed.
       </Alert>
+
+      {/* How thresholds work — UI only, the math itself does not change */}
+      <div className="card bg-gray-50 border-gray-200 text-sm text-gray-700 space-y-1">
+        <p>
+          <strong className="text-gray-900">Passing Score</strong> &nbsp;— the minimum
+          percentage a student must achieve across the items mapped to a CLO to be
+          counted as having <em>passed</em> that CLO.
+        </p>
+        <p>
+          <strong className="text-gray-900">Target Attainment</strong> &nbsp;— the
+          percentage of students that must pass for the CLO to be marked
+          <span className="ml-1 text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-medium">Achieved</span>.
+        </p>
+        <p className="text-xs text-gray-500 pt-1 border-t border-gray-200 mt-2">
+          Example: with Target = 70% and Passing = 60%, a CLO is achieved when at
+          least <strong>70%</strong> of students score <strong>≥ 60%</strong> on the
+          assessment items mapped to that CLO.
+        </p>
+      </div>
 
       {loading ? (
         <div className="space-y-3">
@@ -915,11 +960,17 @@ function MappingTab({ courseId }) {
     itemsByAssessment.get(it.assessment_id).push(it)
   }
 
+  // Identify items not yet mapped to any CLO so faculty sees them at a glance.
+  const itemsMappedAny = new Set(
+    [...pairs].map(k => k.split('|')[1])
+  )
+
   return (
     <div className="space-y-4">
       <Alert type="info">
-        Tick the boxes to indicate which assessment items measure each CLO. Each item
-        may map to one or more CLOs. Click <strong>Save Mapping</strong> when done.
+        Each row is an assessment item, grouped under its assessment. Tick the CLO
+        columns the item measures. An item may map to one or more CLOs — every item
+        should map to at least one. Click <strong>Save Mapping</strong> when done.
       </Alert>
 
       <div className="flex items-center justify-between flex-wrap gap-2">
@@ -936,63 +987,88 @@ function MappingTab({ courseId }) {
         </div>
       </div>
 
-      {/* Mapping matrix */}
+      {/* Mapping matrix — rows: items grouped by assessment; cols: CLOs */}
       <div className="card overflow-x-auto p-0">
-        <table className="text-sm border-collapse">
+        <table className="text-sm border-collapse w-full">
           <thead>
             <tr className="bg-gray-50">
               <th className="text-left px-4 py-3 font-medium text-gray-500 sticky left-0 bg-gray-50 z-10 border-r border-gray-100">
-                CLO
+                Assessment → Item
               </th>
-              {assessments.map(a => {
-                const cols = itemsByAssessment.get(a.id) || []
-                if (cols.length === 0) return null
-                return (
-                  <th
-                    key={a.id} colSpan={cols.length}
-                    className="text-center px-2 py-2 text-xs font-semibold text-gray-700 border-l border-gray-100"
-                  >
-                    {a.name}
-                  </th>
-                )
-              })}
-            </tr>
-            <tr className="bg-gray-50 border-t border-gray-100">
-              <th className="sticky left-0 bg-gray-50 z-10 border-r border-gray-100"></th>
-              {assessments.flatMap(a => (itemsByAssessment.get(a.id) || []).map(it => (
+              {clos.map(c => (
                 <th
-                  key={it.id}
-                  className="text-center px-2 py-2 text-xs font-medium text-gray-500 border-l border-gray-100 whitespace-nowrap"
-                  title={`${a.name} · ${it.name} (out of ${it.full_mark})`}
+                  key={c.id}
+                  className="text-center px-3 py-2 text-xs font-semibold text-gray-700 border-l border-gray-100 whitespace-nowrap"
+                  title={c.description}
                 >
-                  {it.name}
+                  <div className="text-indigo-700">{c.code}</div>
                 </th>
-              )))}
+              ))}
             </tr>
           </thead>
           <tbody>
-            {clos.map(c => (
-              <tr key={c.id} className="border-t border-gray-100 hover:bg-gray-50/50">
-                <td className="px-4 py-3 sticky left-0 bg-white hover:bg-gray-50/50 z-10 border-r border-gray-100">
-                  <div className="font-bold text-indigo-700 text-sm">{c.code}</div>
-                  <div className="text-xs text-gray-500 max-w-[220px] truncate" title={c.description}>
-                    {c.description}
-                  </div>
-                </td>
-                {assessments.flatMap(a => (itemsByAssessment.get(a.id) || []).map(it => {
-                  const checked = pairs.has(`${c.id}|${it.id}`)
-                  return (
-                    <td key={it.id} className="text-center border-l border-gray-100 px-2 py-2">
-                      <input
-                        type="checkbox" checked={checked}
-                        onChange={() => toggle(c.id, it.id)}
-                        className="w-4 h-4 accent-indigo-600 cursor-pointer"
-                      />
+            {assessments.flatMap(a => {
+              const aItems = itemsByAssessment.get(a.id) || []
+              const rows = [
+                /* Assessment group header row */
+                <tr key={`grp-${a.id}`} className="bg-indigo-50/40 border-t border-indigo-100">
+                  <td
+                    colSpan={1 + clos.length}
+                    className="px-4 py-1.5 text-xs font-semibold text-indigo-800 sticky left-0 bg-indigo-50/40 z-10"
+                  >
+                    {a.name}
+                    <span className="ml-2 text-[11px] font-normal text-indigo-500">
+                      {a.type} · {aItems.length} item{aItems.length === 1 ? '' : 's'}
+                    </span>
+                  </td>
+                </tr>,
+              ]
+              if (aItems.length === 0) {
+                rows.push(
+                  <tr key={`empty-${a.id}`} className="border-t border-gray-50">
+                    <td colSpan={1 + clos.length} className="px-6 py-2 text-xs text-gray-400 italic">
+                      No items in this assessment yet.
                     </td>
+                  </tr>
+                )
+              } else {
+                for (const it of aItems) {
+                  const unmapped = !itemsMappedAny.has(it.id)
+                  rows.push(
+                    <tr key={it.id} className="border-t border-gray-50 hover:bg-gray-50/50">
+                      <td className="px-6 py-2 sticky left-0 bg-white hover:bg-gray-50/50 z-10 border-r border-gray-100">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-gray-700">{it.name}</span>
+                          <span className="text-[11px] text-gray-400">/ {it.full_mark}</span>
+                          {unmapped && (
+                            <span
+                              className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full"
+                              title="Not mapped to any CLO"
+                            >
+                              unmapped
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      {clos.map(c => {
+                        const checked = pairs.has(`${c.id}|${it.id}`)
+                        return (
+                          <td key={c.id} className="text-center border-l border-gray-100 px-2 py-2">
+                            <input
+                              type="checkbox" checked={checked}
+                              onChange={() => toggle(c.id, it.id)}
+                              className="w-4 h-4 accent-indigo-600 cursor-pointer"
+                              title={`Map ${it.name} → ${c.code}`}
+                            />
+                          </td>
+                        )
+                      })}
+                    </tr>
                   )
-                }))}
-              </tr>
-            ))}
+                }
+              }
+              return rows
+            })}
           </tbody>
         </table>
       </div>
@@ -1009,9 +1085,11 @@ function StudentsTab({ courseId }) {
   const [assessments, setAssessments] = useState([])
   const [items,       setItems]       = useState([])
   const [grades,      setGrades]      = useState({})    // local edits keyed `${studentId}|${itemId}`
+  const [dirty,       setDirty]       = useState(new Set())  // unsaved cell keys
+  const [saveStatus,  setSaveStatus]  = useState('idle')     // idle | dirty | saving | saved | error
+  const [errorMsg,    setErrorMsg]    = useState('')
   const [loading,     setLoading]     = useState(true)
-  const [saving,      setSaving]      = useState(false)
-  const [savedMsg,    setSavedMsg]    = useState('')
+  const fileInputRef                  = useRef()
 
   // Roster controls
   const [showAdd,     setShowAdd]     = useState(false)
@@ -1032,12 +1110,24 @@ function StudentsTab({ courseId }) {
       setAssessments(a.data || [])
       setItems(i.data || [])
       setGrades(g.data?.grades || {})
+      setDirty(new Set())
+      setSaveStatus('idle')
+      setErrorMsg('')
     } finally {
       setLoading(false)
     }
   }
 
   useEffect(() => { load() }, [courseId])
+
+  // Warn before navigating away with unsaved edits
+  useEffect(() => {
+    const handler = (e) => {
+      if (dirty.size > 0) { e.preventDefault(); e.returnValue = '' }
+    }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [dirty])
 
   const addOne = async (e) => {
     e.preventDefault()
@@ -1049,23 +1139,44 @@ function StudentsTab({ courseId }) {
     } catch (err) { alert(err.response?.data?.detail || 'Failed to add student') }
   }
 
+  // Parse "student_id, student_name" rows from a free-text blob.
+  // Accepts comma, tab, or whitespace separators. Skips a leading header row
+  // if it looks like one. Hook left here intentionally simple — future AI
+  // extraction can replace this function without touching the UI.
+  const parseRosterText = (text) => {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+    if (lines.length === 0) return []
+    // Skip header row like "student_id, student_name" / "id,name"
+    const headerLike = /^(student[_ ]?id|id)[,\t\s]+(student[_ ]?name|name)/i
+    const body = headerLike.test(lines[0]) ? lines.slice(1) : lines
+    return body.map(line => {
+      const parts = line.split(/[,\t]/).map(p => p.trim()).filter(Boolean)
+      if (parts.length >= 2) return { student_id: parts[0], name: parts.slice(1).join(' ') }
+      const split = line.split(/\s+/)
+      return { student_id: split[0], name: split.slice(1).join(' ') || split[0] }
+    }).filter(r => r.student_id && r.name)
+  }
+
   const addBulk = async () => {
-    const rows = bulkText.split('\n')
-      .map(line => line.trim()).filter(Boolean)
-      .map(line => {
-        // Accept "ID,Name" or "ID Name" (tab/comma)
-        const parts = line.split(/[,\t]/).map(p => p.trim()).filter(Boolean)
-        if (parts.length >= 2) return { student_id: parts[0], name: parts.slice(1).join(' ') }
-        const split = line.split(/\s+/)
-        return { student_id: split[0], name: split.slice(1).join(' ') || split[0] }
-      })
-      .filter(r => r.student_id && r.name)
-    if (rows.length === 0) return alert('No valid rows. Use one student per line: ID, Name')
+    const rows = parseRosterText(bulkText)
+    if (rows.length === 0) return alert('No valid rows. Use one student per line: student_id, student_name')
     try {
       await bulkAddStudents(courseId, rows)
       setBulkText(''); setBulkOpen(false)
-      load()
+      load()      // refresh roster + grades grid → new students appear immediately
     } catch (err) { alert(err.response?.data?.detail || 'Bulk add failed') }
+  }
+
+  const handleCsvFile = (file) => {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (ev) => {
+      const txt = String(ev.target?.result || '')
+      // Append to the textarea so the user can review/edit before importing
+      setBulkText(prev => (prev ? prev + '\n' : '') + txt.trim())
+    }
+    reader.onerror = () => alert('Failed to read file')
+    reader.readAsText(file)
   }
 
   const removeStudent = async (id) => {
@@ -1075,29 +1186,40 @@ function StudentsTab({ courseId }) {
   }
 
   const onCellChange = (studentId, itemId, value) => {
-    setGrades(prev => ({ ...prev, [`${studentId}|${itemId}`]: value }))
-    setSavedMsg('')
+    const k = `${studentId}|${itemId}`
+    setGrades(prev => ({ ...prev, [k]: value }))
+    setDirty(prev => {
+      const next = new Set(prev)
+      next.add(k)
+      return next
+    })
+    setSaveStatus('dirty')
+    setErrorMsg('')
   }
 
+  // Save only the cells the user actually edited.
+  // Each grade is sent as { student_id, assessment_item_id (= item_id), score }
+  // and persisted with an upsert on (student_id, item_id) — never tied to a CLO.
   const saveAll = async () => {
-    setSaving(true); setSavedMsg('')
+    if (dirty.size === 0) return
+    setSaveStatus('saving'); setErrorMsg('')
     try {
       const list = []
-      for (const s of students) {
-        for (const it of items) {
-          const k = `${s.id}|${it.id}`
-          const v = grades[k]
-          if (v === '' || v === undefined || v === null) continue
-          list.push({ student_id: s.id, item_id: it.id, score: v })
-        }
+      for (const k of dirty) {
+        const [student_id, item_id] = k.split('|')
+        const v = grades[k]
+        if (v === '' || v === undefined || v === null) continue
+        list.push({ student_id, item_id, score: v })
       }
-      const r = await saveItemGrades(courseId, list)
-      setSavedMsg(r.data?.message || 'Grades saved.')
-      load()
+      await saveItemGrades(courseId, list)
+      setDirty(new Set())
+      setSaveStatus('saved')
+      // Refresh from server so any server-side coercion is reflected
+      const g = await getItemGrades(courseId)
+      setGrades(g.data?.grades || {})
     } catch (err) {
-      alert(err.response?.data?.detail || 'Save failed')
-    } finally {
-      setSaving(false)
+      setSaveStatus('error')
+      setErrorMsg(err.response?.data?.detail || 'Save failed')
     }
   }
 
@@ -1158,14 +1280,35 @@ function StudentsTab({ courseId }) {
 
         {bulkOpen && (
           <div className="mb-3 p-2 bg-gray-50 rounded-lg">
-            <label className="text-xs text-gray-500 block mb-1">
-              One student per line — <code>ID, Name</code> or <code>ID Name</code>
-            </label>
+            <div className="flex items-center justify-between gap-2 mb-1">
+              <label className="text-xs text-gray-500">
+                One student per line — format: <code>student_id, student_name</code>
+              </label>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="btn-secondary text-xs flex items-center gap-1"
+                  title="Load a CSV / TXT file into the box below"
+                >
+                  <Upload size={11} /> Load CSV / TXT
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file" className="hidden"
+                  accept=".csv,.txt,text/csv,text/plain"
+                  onChange={(e) => { handleCsvFile(e.target.files?.[0]); e.target.value = '' }}
+                />
+              </div>
+            </div>
             <textarea
               rows={4} className="input text-sm font-mono"
               value={bulkText} onChange={e => setBulkText(e.target.value)}
-              placeholder={`S001, Ahmad Ali\nS002, Fatima Khan\nS003, Omar Hassan`}
+              placeholder={`student_id, student_name\nS001, Ahmad Ali\nS002, Fatima Khan\nS003, Omar Hassan`}
             />
+            <p className="text-[11px] text-gray-400 mt-1">
+              Header row (e.g. <code>student_id, student_name</code>) is skipped automatically.
+            </p>
             <div className="flex justify-end mt-2">
               <button onClick={addBulk} className="btn-primary text-xs">Import</button>
             </div>
@@ -1193,11 +1336,20 @@ function StudentsTab({ courseId }) {
       {students.length > 0 && items.length > 0 && (
         <div className="space-y-2">
           <div className="flex items-center justify-between flex-wrap gap-2">
-            <h4 className="font-semibold text-gray-900">Item Grades</h4>
+            <div>
+              <h4 className="font-semibold text-gray-900">Item Grades</h4>
+              <p className="text-xs text-gray-400 mt-0.5">
+                Each grade is stored as <code>student_id + assessment_item + score</code> — never tied to a CLO.
+              </p>
+            </div>
             <div className="flex items-center gap-3">
-              {savedMsg && <span className="text-xs text-green-600">{savedMsg}</span>}
-              <button onClick={saveAll} disabled={saving} className="btn-primary text-sm flex items-center gap-1">
-                <Save size={13} /> {saving ? 'Saving…' : 'Save All Grades'}
+              <SaveStatusBadge status={saveStatus} dirtyCount={dirty.size} errorMsg={errorMsg} />
+              <button
+                onClick={saveAll}
+                disabled={saveStatus === 'saving' || dirty.size === 0}
+                className="btn-primary text-sm flex items-center gap-1 disabled:opacity-50"
+              >
+                <Save size={13} /> {saveStatus === 'saving' ? 'Saving…' : 'Save All Grades'}
               </button>
             </div>
           </div>
@@ -1243,16 +1395,25 @@ function StudentsTab({ courseId }) {
                       const max = Number(it.full_mark) || 0
                       const num = v === '' ? null : Number(v)
                       const over = num !== null && num > max
+                      const isDirty = dirty.has(k)
                       return (
                         <td key={it.id} className="border-l border-gray-100 px-1 py-1 text-center">
-                          <input
-                            type="number" min={0} step={0.1}
-                            className={`w-16 text-sm text-right rounded border px-1.5 py-1 ${
-                              over ? 'border-red-300 bg-red-50' : 'border-gray-200'
-                            }`}
-                            value={v}
-                            onChange={e => onCellChange(s.id, it.id, e.target.value)}
-                          />
+                          <div className="relative inline-block">
+                            <input
+                              type="number" min={0} step={0.1}
+                              title={over ? `Score exceeds full mark (${max})` : isDirty ? 'Unsaved change' : ''}
+                              className={`w-16 text-sm text-right rounded border px-1.5 py-1 ${
+                                over    ? 'border-red-300 bg-red-50'
+                                : isDirty ? 'border-amber-300 bg-amber-50'
+                                          : 'border-gray-200'
+                              }`}
+                              value={v}
+                              onChange={e => onCellChange(s.id, it.id, e.target.value)}
+                            />
+                            {isDirty && !over && (
+                              <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-amber-500 rounded-full" />
+                            )}
+                          </div>
                         </td>
                       )
                     }))}
@@ -1313,18 +1474,30 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
 
   return (
     <div className="space-y-6 max-w-5xl">
-      {/* Generate button */}
+      {/* Generate / Export buttons */}
       <div className="card flex items-center justify-between flex-wrap gap-3">
         <div>
           <h3 className="font-semibold text-gray-900">FCAR Attainment Report</h3>
           <p className="text-sm text-gray-500 mt-0.5">
-            CLO attainment is derived from CLO ↔ item mappings and student item grades.
+            CLO attainment is derived from CLO ↔ item mappings and student item grades
+            (weighted by full marks).
           </p>
         </div>
-        <button onClick={handleGenerate} disabled={loading} className="btn-primary flex items-center gap-2">
-          <BarChart3 size={16} />
-          {loading ? 'Calculating…' : generated ? 'Refresh Report' : 'Generate Report'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => alert('Report export is coming soon. The data shown on this page is fully derived from your assessments and grades.')}
+            disabled={!generated || !report}
+            className="btn-secondary text-sm flex items-center gap-2 disabled:opacity-50"
+            title="Export will be available in a future update"
+          >
+            <Download size={14} /> Export Report
+            <span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full">Coming Soon</span>
+          </button>
+          <button onClick={handleGenerate} disabled={loading} className="btn-primary flex items-center gap-2">
+            <BarChart3 size={16} />
+            {loading ? 'Calculating…' : generated ? 'Refresh Report' : 'Generate Report'}
+          </button>
+        </div>
       </div>
 
       {/* Evidence completion status */}
@@ -1410,10 +1583,19 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
-                  {cloResults.map(r => (
-                    <tr key={r.clo_id} className="hover:bg-gray-50">
+                  {cloResults.map(r => {
+                    const weak = !r.no_mapping && r.status !== 'Achieved'
+                    return (
+                    <tr key={r.clo_id} className={weak ? 'bg-red-50/40 hover:bg-red-50/60' : 'hover:bg-gray-50'}>
                       <td className="px-4 py-3">
-                        <div className="font-bold text-indigo-700">{r.clo_code}</div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-bold text-indigo-700">{r.clo_code}</span>
+                          {weak && (
+                            <span className="text-[10px] bg-red-100 text-red-700 px-1.5 py-0.5 rounded-full font-medium">
+                              Weak
+                            </span>
+                          )}
+                        </div>
                         <div className="text-xs text-gray-500 max-w-xs truncate" title={r.description}>
                           {r.description}
                         </div>
@@ -1442,21 +1624,57 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
                         {r.no_mapping ? (
                           <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">No mapping</span>
                         ) : r.status === 'Achieved' ? (
-                          <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">
-                            Achieved
+                          <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-1">
+                            <CheckCircle size={11} /> Achieved
                           </span>
                         ) : (
-                          <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium">
-                            Not Achieved
+                          <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-medium inline-flex items-center gap-1">
+                            <AlertCircle size={11} /> Not Achieved
                           </span>
                         )}
                       </td>
                     </tr>
-                  ))}
+                  )})}
                 </tbody>
               </table>
             </div>
           </div>
+
+          {/* Recommendations / Action Plan placeholder for weak CLOs */}
+          {(() => {
+            const weakClos = cloResults.filter(r => !r.no_mapping && r.status !== 'Achieved')
+            if (weakClos.length === 0) return null
+            return (
+              <div className="card border-amber-200 bg-amber-50/40">
+                <h4 className="font-semibold text-gray-900 mb-1">Recommendations / Action Plan</h4>
+                <p className="text-xs text-gray-500 mb-3">
+                  The following CLOs did not meet their target attainment. Use this as a
+                  starting point for your continuous-improvement plan.
+                </p>
+                <ul className="space-y-2">
+                  {weakClos.map(r => (
+                    <li key={r.clo_id} className="text-sm">
+                      <div className="flex items-start gap-2">
+                        <AlertCircle size={14} className="text-amber-600 mt-0.5 shrink-0" />
+                        <div>
+                          <div className="font-semibold text-gray-800">
+                            {r.clo_code}
+                            <span className="text-xs text-gray-500 font-normal ml-2">
+                              ({fmt(r.attainment_percentage)}% vs target {r.target_attainment}%)
+                            </span>
+                          </div>
+                          <div className="text-gray-600">
+                            Consider revising the teaching strategy, adding practice activities,
+                            and improving assessment alignment for this CLO.
+                          </div>
+                        </div>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )
+          })()}
 
           {/* NCAAA Domain Summary */}
           {Object.keys(domainSummary).length > 0 && (

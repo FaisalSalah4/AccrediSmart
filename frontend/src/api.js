@@ -417,10 +417,17 @@ export const saveItemGrades = async (_courseId, gradeList) => {
 //   actual_attainment = passed_count / total_students × 100
 //   status            = "Achieved" if actual_attainment ≥ clo.target_attainment
 //
+// NOTE: pct uses WEIGHTED item marks (Σ score / Σ full_mark) — items with larger
+// full_mark contribute more weight, exactly as the spec requires. We do not
+// average item percentages.
+//
 // Warnings emitted:
-//   • CLO has no mapped assessment items
-//   • Assessment item not mapped to any CLO
-//   • Missing student grades on items mapped to a CLO
+//   • CLO has no mapped assessment items                    (clo_no_items)
+//   • Assessment item not mapped to any CLO                 (item_no_clo)
+//   • Assessment has no items                               (assessment_no_items)
+//   • Σ item full_marks ≠ assessment.total_mark             (item_marks_total_mismatch)
+//   • Recorded score exceeds the item's full_mark           (score_over_full_mark)
+//   • Missing student grades on items mapped to a CLO       (missing_grades)
 // ─────────────────────────────────────────────────────────────────────────────
 export const calculateAttainment = async (courseId) => {
   const [courseRes, closRes, studentsRes, assessRes, itemsRes, mapRes, gradesRes] =
@@ -548,6 +555,48 @@ export const calculateAttainment = async (courseId) => {
         kind: 'item_no_clo', item_id: it.id,
         message: `Item "${a?.name || ''} → ${it.name}" is not mapped to any CLO.`,
       })
+    }
+  }
+
+  // Assessments that have no items, and assessments whose item-mark sum ≠ total_mark
+  const itemsByAssessment = new Map()
+  for (const a of assessments) itemsByAssessment.set(a.id, [])
+  for (const it of items) {
+    if (!itemsByAssessment.has(it.assessment_id)) itemsByAssessment.set(it.assessment_id, [])
+    itemsByAssessment.get(it.assessment_id).push(it)
+  }
+  for (const a of assessments) {
+    const aItems = itemsByAssessment.get(a.id) || []
+    if (aItems.length === 0) {
+      warnings.push({
+        kind: 'assessment_no_items', assessment_id: a.id,
+        message: `Assessment "${a.name}" has no items.`,
+      })
+      continue
+    }
+    const sum = aItems.reduce((s, it) => s + (Number(it.full_mark) || 0), 0)
+    const total = Number(a.total_mark) || 0
+    if (total > 0 && Math.abs(sum - total) > 0.01) {
+      warnings.push({
+        kind: 'item_marks_total_mismatch', assessment_id: a.id,
+        message: `Assessment "${a.name}" item marks total ${sum} but the assessment total is ${total}.`,
+      })
+    }
+  }
+
+  // Scores that exceed an item's full_mark
+  for (const it of items) {
+    for (const s of students) {
+      const score = gradeMap[`${s.id}|${it.id}`]
+      if (score === undefined || score === null || score === '') continue
+      const max = Number(it.full_mark) || 0
+      if (Number(score) > max) {
+        const a = assessById.get(it.assessment_id)
+        warnings.push({
+          kind: 'score_over_full_mark', item_id: it.id, student_id: s.id,
+          message: `${s.student_id} ${s.name}: score ${score} on "${a?.name || ''} → ${it.name}" exceeds full mark ${max}.`,
+        })
+      }
     }
   }
 
