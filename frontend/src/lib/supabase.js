@@ -10,4 +10,12 @@ if (!supabaseUrl || !supabaseKey) {
   )
 }
 
-export const supabase = createClient(supabaseUrl, supabaseKey)
+// Explicit auth options so a long-idle session refreshes its token instead of
+// silently expiring (which used to manifest as a hard 404 on next navigation).
+export const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    persistSession:     true,
+    autoRefreshToken:   true,
+    detectSessionInUrl: true,
+  },
+})

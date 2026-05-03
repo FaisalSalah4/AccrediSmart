@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import {
   getCourse, getDocuments, uploadDocument, deleteDocument, getDocumentUrl,
@@ -9,17 +9,35 @@ import {
   getCloItemMap, setCloItemMap,
   getItemGrades, saveItemGrades,
   calculateAttainment,
+  getProgramOutcomes, getStudentOutcomes, getSAQFDomains,
+  getCloRecommendations, upsertCloRecommendation,
+  getSOAttainments, upsertSOAttainment,
+  getSAQFAttainments, upsertSAQFAttainment,
 } from '../api'
 import { EVIDENCE_TYPES, ASSESSMENT_TYPES } from '../constants'
+import { useAuth } from '../contexts/AuthContext'
+import { recommendationFor, saqfRecommendationFor } from '../lib/recommendations'
+import { exportFcarReport } from '../lib/exportReport'
 import {
   Upload, FileText, Trash2, Download, X, Edit2, Save,
   BarChart3, BookOpen, Target, AlertCircle, CheckCircle, Lock,
-  Users, ClipboardList, Link2, Plus,
+  Users, ClipboardList, Link2, Plus, Award, Layers,
 } from 'lucide-react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, Cell,
 } from 'recharts'
+
+// Maps the existing free-text `clos.ncaaa_domain` values to the SAQF domain
+// codes used in the new `saqf_domains` table. This lets us roll up CLO
+// results into the SAQF/NCAAA tab without changing how CLOs are stored.
+const NCAAA_TO_SAQF = {
+  'Knowledge':                              'knowledge_understanding',
+  'Cognitive Skills':                       'cognitive_skills',
+  'Interpersonal Skills & Responsibility':  'autonomy_responsibility',
+  'Communication, IT & Numerical Skills':   'communication_ict',
+  'Psychomotor Skills':                     'practical_physical',
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -32,19 +50,42 @@ const NCAAA_DOMAINS = [
 ]
 
 const TABS = [
-  { id: 'overview',    label: 'Overview',           icon: BookOpen      },
-  { id: 'documents',   label: 'Evidence Files',     icon: FileText      },
-  { id: 'clos',        label: 'CLOs',               icon: Target        },
-  { id: 'assessments', label: 'Assessments',        icon: ClipboardList },
-  { id: 'mapping',     label: 'CLO ↔ Items',        icon: Link2         },
-  { id: 'students',    label: 'Students & Grades',  icon: Users         },
-  { id: 'report',      label: 'Attainment Report',  icon: BarChart3     },
+  { id: 'overview',    label: 'Overview',                icon: BookOpen      },
+  { id: 'documents',   label: 'Evidence Files',          icon: FileText      },
+  { id: 'clos',        label: 'CLOs',                    icon: Target        },
+  { id: 'assessments', label: 'Assessments',             icon: ClipboardList },
+  { id: 'mapping',     label: 'CLO ↔ Items',             icon: Link2         },
+  { id: 'students',    label: 'Students & Grades',       icon: Users         },
+  { id: 'report',      label: 'Attainment Report',       icon: BarChart3     },
+  { id: 'abet',        label: 'ABET SO Attainment',      icon: Award         },
+  { id: 'saqf',        label: 'SAQF / NCAAA Attainment', icon: Layers        },
 ]
 
 // Tabs that require all 9 evidence categories to be uploaded
-const LOCKED_TABS = new Set(['clos', 'assessments', 'mapping', 'students', 'report'])
+const LOCKED_TABS = new Set(['clos', 'assessments', 'mapping', 'students', 'report', 'abet', 'saqf'])
 
 const fmt = (n) => (typeof n === 'number' ? n.toFixed(1) : '—')
+
+// Strip unnecessary leading zeros from a numeric input string (`011` → `11`,
+// `0.5` stays `0.5`, `000` → `0`). Returns the cleaned string so React
+// re-renders with the normalised value. Called on blur so we don't fight the
+// user mid-typing.
+const normaliseLeadingZeros = (raw) => {
+  if (raw === '' || raw === null || raw === undefined) return ''
+  const s = String(raw).trim()
+  if (!/^-?\d+(\.\d+)?$/.test(s) && !/^-?\d+\.$/.test(s)) return s
+  if (s.startsWith('-')) return '-' + normaliseLeadingZeros(s.slice(1))
+  if (s.includes('.')) {
+    const [intPart, dec] = s.split('.')
+    const cleanedInt = intPart.replace(/^0+(?=\d)/, '') || '0'
+    return `${cleanedInt}.${dec}`
+  }
+  return s.replace(/^0+(?=\d)/, '') || '0'
+}
+
+// Hard caps used by the UI; mirrored on the server for defense in depth.
+const MAX_TOTAL_MARK = 1000   // assessment.total_mark
+const MAX_WEIGHT     = 100    // course weight %
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -244,7 +285,11 @@ function EvidenceSection({ type, files, courseId, onRefresh }) {
           </button>
           <input
             ref={fileRef} type="file" multiple className="hidden"
-            accept=".pdf,.docx,.doc,.xlsx,.xls"
+            accept={
+              type.value === 'teaching_materials'
+                ? '.pdf,.docx,.doc,.xlsx,.xls,.zip'
+                : '.pdf,.docx,.doc,.xlsx,.xls'
+            }
             onChange={e => handleUpload(e.target.files)}
           />
         </div>
@@ -382,35 +427,68 @@ const DOMAIN_BADGE = {
   'Psychomotor Skills':                     'bg-rose-100 text-rose-700',
 }
 
-function CLOsTab({ courseId }) {
-  const [clos, setClos]         = useState([])
-  const [loading, setLoading]   = useState(true)
-  const [editingId, setEditingId] = useState(null)
-  const [editValues, setEditValues] = useState({})
-  const [saving, setSaving]     = useState(false)
+function CLOsTab({ courseId, course }) {
+  const { isAdmin } = useAuth()
+  const [clos,    setClos]    = useState([])
+  const [plos,    setPlos]    = useState([])
+  const [sos,     setSos]     = useState([])
+  const [loading, setLoading] = useState(true)
+  const [editingId,   setEditingId]   = useState(null)
+  const [editValues,  setEditValues]  = useState({})
+  const [saving,      setSaving]      = useState(false)
+  const [errMsg,      setErrMsg]      = useState('')
 
-  const load = () =>
-    getCLOs(courseId).then(r => setClos(r.data)).finally(() => setLoading(false))
+  // Load CLOs + the department-scoped PLO / SO reference lists from the DB.
+  // This means PLO/SO options come from `program_outcomes` / `student_outcomes`
+  // for the *course's department* — not a static constant. Works for every
+  // department in DEPARTMENTS without per-course hardcoding.
+  const load = async () => {
+    setLoading(true)
+    try {
+      const [cRes, pRes, sRes] = await Promise.all([
+        getCLOs(courseId),
+        course?.department ? getProgramOutcomes(course.department) : Promise.resolve({ data: [] }),
+        course?.department ? getStudentOutcomes(course.department) : Promise.resolve({ data: [] }),
+      ])
+      setClos(cRes.data || [])
+      setPlos(pRes.data || [])
+      setSos(sRes.data  || [])
+    } finally {
+      setLoading(false)
+    }
+  }
 
-  useEffect(() => { load() }, [courseId])
+  useEffect(() => { load() }, [courseId, course?.department])
 
   const startEdit = (clo) => {
     setEditingId(clo.id)
     setEditValues({
       target_attainment: clo.target_attainment,
       passing_score:     clo.passing_score,
+      plo_mapping:       clo.plo_mapping || '',
+      so_mapping:        clo.so_mapping  || '',
     })
+    setErrMsg('')
   }
 
   const handleSave = async (cloId) => {
-    setSaving(true)
+    setSaving(true); setErrMsg('')
     try {
-      await updateCLO(cloId, {
-        target_attainment: Math.min(90, Math.max(60, Number(editValues.target_attainment))),
-        passing_score:     Math.min(80, Math.max(50, Number(editValues.passing_score))),
-      })
+      const payload = {
+        // PLO/SO are always editable
+        plo_mapping: editValues.plo_mapping || null,
+        so_mapping:  editValues.so_mapping  || null,
+      }
+      // Thresholds only included if the current user is an admin.
+      if (isAdmin) {
+        payload.target_attainment = Math.min(90, Math.max(60, Number(editValues.target_attainment)))
+        payload.passing_score     = Math.min(80, Math.max(50, Number(editValues.passing_score)))
+      }
+      await updateCLO(cloId, payload)
       setEditingId(null)
       load()
+    } catch (err) {
+      setErrMsg(err.response?.data?.detail || 'Save failed')
     } finally {
       setSaving(false)
     }
@@ -419,9 +497,10 @@ function CLOsTab({ courseId }) {
   return (
     <div className="space-y-4 max-w-4xl">
       <Alert type="info">
-        CLOs are pre-populated based on department standards. You may only adjust the{' '}
-        <strong>Target Attainment</strong> (60–90%) and <strong>Passing Score</strong> (50–80%).
-        All other fields are fixed.
+        CLOs are pre-populated from department standards. PLO and SO mappings can be
+        adjusted by faculty.{' '}
+        <strong>Target Attainment</strong> and <strong>Passing Score</strong> can only
+        be changed by an administrator.
       </Alert>
 
       {/* How thresholds work — UI only, the math itself does not change */}
@@ -481,42 +560,94 @@ function CLOsTab({ courseId }) {
 
                   {/* Edit form or read-only values */}
                   {editingId === clo.id ? (
-                    <div className="flex items-end gap-3 flex-wrap">
-                      <div>
-                        <label className="text-xs text-gray-500 block mb-1">
-                          Target Attainment % <span className="text-gray-400">(60–90)</span>
-                        </label>
-                        <input
-                          type="number" min={60} max={90} className="input w-24 text-sm"
-                          value={editValues.target_attainment}
-                          onChange={e => setEditValues(v => ({ ...v, target_attainment: e.target.value }))}
-                        />
+                    <div className="space-y-3">
+                      <div className="flex items-end gap-3 flex-wrap">
+                        {/* Target Attainment — admin only */}
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">
+                            Target Attainment % <span className="text-gray-400">(60–90)</span>
+                            {!isAdmin && <Lock size={10} className="inline ml-1 text-gray-300" />}
+                          </label>
+                          <input
+                            type="number" min={60} max={90}
+                            className="input w-24 text-sm disabled:bg-gray-50 disabled:text-gray-400"
+                            value={editValues.target_attainment}
+                            disabled={!isAdmin}
+                            title={isAdmin ? '' : 'Only an admin can change Target Attainment'}
+                            onChange={e => setEditValues(v => ({ ...v, target_attainment: e.target.value }))}
+                          />
+                        </div>
+                        {/* Passing Score — admin only */}
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">
+                            Passing Score % <span className="text-gray-400">(50–80)</span>
+                            {!isAdmin && <Lock size={10} className="inline ml-1 text-gray-300" />}
+                          </label>
+                          <input
+                            type="number" min={50} max={80}
+                            className="input w-24 text-sm disabled:bg-gray-50 disabled:text-gray-400"
+                            value={editValues.passing_score}
+                            disabled={!isAdmin}
+                            title={isAdmin ? '' : 'Only an admin can change Passing Score'}
+                            onChange={e => setEditValues(v => ({ ...v, passing_score: e.target.value }))}
+                          />
+                        </div>
+                        {/* PLO mapping — DB-driven dropdown */}
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">PLO</label>
+                          <select
+                            className="input w-32 text-sm"
+                            value={editValues.plo_mapping || ''}
+                            onChange={e => setEditValues(v => ({ ...v, plo_mapping: e.target.value }))}
+                          >
+                            <option value="">—</option>
+                            {plos.map(p => (
+                              <option key={p.id} value={p.code} title={p.description}>
+                                {p.code}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        {/* SO mapping — DB-driven dropdown */}
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">SO</label>
+                          <select
+                            className="input w-32 text-sm"
+                            value={editValues.so_mapping || ''}
+                            onChange={e => setEditValues(v => ({ ...v, so_mapping: e.target.value }))}
+                          >
+                            <option value="">—</option>
+                            {sos.map(s => (
+                              <option key={s.id} value={s.code} title={s.description}>
+                                {s.code}{s.related_plo ? ` (↔ ${s.related_plo})` : ''}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleSave(clo.id)}
+                            disabled={saving}
+                            className="btn-primary text-xs flex items-center gap-1"
+                          >
+                            <Save size={12} /> {saving ? 'Saving…' : 'Save'}
+                          </button>
+                          <button
+                            onClick={() => setEditingId(null)}
+                            className="btn-secondary text-xs"
+                          >
+                            Cancel
+                          </button>
+                        </div>
                       </div>
-                      <div>
-                        <label className="text-xs text-gray-500 block mb-1">
-                          Passing Score % <span className="text-gray-400">(50–80)</span>
-                        </label>
-                        <input
-                          type="number" min={50} max={80} className="input w-24 text-sm"
-                          value={editValues.passing_score}
-                          onChange={e => setEditValues(v => ({ ...v, passing_score: e.target.value }))}
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => handleSave(clo.id)}
-                          disabled={saving}
-                          className="btn-primary text-xs flex items-center gap-1"
-                        >
-                          <Save size={12} /> {saving ? 'Saving…' : 'Save'}
-                        </button>
-                        <button
-                          onClick={() => setEditingId(null)}
-                          className="btn-secondary text-xs"
-                        >
-                          Cancel
-                        </button>
-                      </div>
+                      {!isAdmin && (
+                        <p className="text-[11px] text-gray-400 italic">
+                          Threshold fields are locked. Contact an administrator if you need to adjust them.
+                        </p>
+                      )}
+                      {errMsg && (
+                        <p className="text-xs text-red-600">{errMsg}</p>
+                      )}
                     </div>
                   ) : (
                     <div className="flex items-center gap-4 text-xs text-gray-400 flex-wrap">
@@ -532,7 +663,7 @@ function CLOsTab({ courseId }) {
                   <button
                     onClick={() => startEdit(clo)}
                     className="p-2 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg shrink-0"
-                    title="Adjust targets"
+                    title={isAdmin ? 'Adjust targets and PLO/SO' : 'Adjust PLO/SO mappings'}
                   >
                     <Edit2 size={15} />
                   </button>
@@ -649,20 +780,24 @@ function AssessmentsTab({ courseId }) {
             </div>
             <div>
               <label className="text-xs text-gray-500 block mb-1">
-                Course Weight % <span className="text-gray-400">(informational)</span>
+                Course Weight % <span className="text-gray-400">(0–{MAX_WEIGHT})</span>
               </label>
               <input
-                type="number" min={0} max={100} step={0.1} className="input text-sm"
+                type="number" min={0} max={MAX_WEIGHT} step={0.1} className="input text-sm"
                 value={form.weight}
                 onChange={e => setForm(f => ({ ...f, weight: e.target.value }))}
+                onBlur={e => setForm(f => ({ ...f, weight: normaliseLeadingZeros(e.target.value) }))}
               />
             </div>
             <div>
-              <label className="text-xs text-gray-500 block mb-1">Total Mark</label>
+              <label className="text-xs text-gray-500 block mb-1">
+                Total Mark <span className="text-gray-400">(max {MAX_TOTAL_MARK})</span>
+              </label>
               <input
-                type="number" min={0} step={0.1} className="input text-sm"
+                type="number" min={0} max={MAX_TOTAL_MARK} step={0.1} className="input text-sm"
                 value={form.total_mark}
                 onChange={e => setForm(f => ({ ...f, total_mark: e.target.value }))}
+                onBlur={e => setForm(f => ({ ...f, total_mark: normaliseLeadingZeros(e.target.value) }))}
               />
             </div>
           </div>
@@ -715,8 +850,25 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
   const [editingItemId, setEditingItemId] = useState(null)
   const [editItem, setEditItem] = useState({ name: '', full_mark: 0 })
 
+  // Running sum of existing item full_marks — drives client-side guards so
+  // we cannot enter a value that the API would reject.
+  const total       = Number(assessment.total_mark) || 0
+  const siblingSum  = items.reduce((s, it) => s + (Number(it.full_mark) || 0), 0)
+  const remaining   = Math.max(0, total - siblingSum)
+  const remainingForEdit = (it) =>
+    Math.max(0, total - (siblingSum - (Number(it.full_mark) || 0)))
+
   const addItem = async (e) => {
     e.preventDefault()
+    const fm = Number(newItem.full_mark)
+    if (!Number.isFinite(fm) || fm <= 0) {
+      alert('Full mark must be greater than 0.')
+      return
+    }
+    if (total > 0 && fm > remaining + 0.01) {
+      alert(`Full mark (${fm}) would push items past the assessment total (${total}). Remaining capacity: ${remaining}.`)
+      return
+    }
     setBusy(true)
     try {
       await createAssessmentItem(assessment.id, newItem)
@@ -733,6 +885,15 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
     setEditingItemId(it.id); setEditItem({ name: it.name, full_mark: it.full_mark })
   }
   const saveEditItem = async () => {
+    const fm = Number(editItem.full_mark)
+    const it = items.find(i => i.id === editingItemId)
+    const cap = it ? remainingForEdit(it) : MAX_TOTAL_MARK
+    if (!Number.isFinite(fm) || fm <= 0) {
+      alert('Full mark must be greater than 0.'); return
+    }
+    if (total > 0 && fm > cap + 0.01) {
+      alert(`Full mark (${fm}) exceeds remaining capacity (${cap}) for this assessment.`); return
+    }
     setBusy(true)
     try {
       await updateAssessmentItem(editingItemId, editItem)
@@ -799,17 +960,27 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
               />
             </div>
             <div className="w-24">
-              <label className="text-xs text-gray-500 block mb-0.5">Full Mark</label>
+              <label className="text-xs text-gray-500 block mb-0.5">
+                Full Mark
+                {total > 0 && <span className="text-[10px] text-gray-400 ml-1">(≤ {remaining})</span>}
+              </label>
               <input
-                type="number" min={0} step={0.1} className="input text-sm" required
+                type="number" min={0} max={total > 0 ? remaining : MAX_TOTAL_MARK} step={0.1}
+                className="input text-sm" required
                 value={newItem.full_mark}
                 onChange={e => setNewItem(v => ({ ...v, full_mark: e.target.value }))}
+                onBlur={e => setNewItem(v => ({ ...v, full_mark: normaliseLeadingZeros(e.target.value) }))}
               />
             </div>
             <button type="submit" disabled={busy} className="btn-primary text-xs h-9">
               {busy ? 'Adding…' : 'Add'}
             </button>
           </form>
+        )}
+        {total > 0 && siblingSum > total + 0.01 && (
+          <p className="text-xs text-red-600 mb-2">
+            Items Σ ({siblingSum}) exceeds the assessment total ({total}). Reduce one or more items.
+          </p>
         )}
 
         {items.length === 0 ? (
@@ -838,10 +1009,13 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
                       </td>
                       <td className="py-1.5 text-right">
                         <input
-                          type="number" min={0} step={0.1}
+                          type="number" min={0}
+                          max={total > 0 ? remainingForEdit(it) : MAX_TOTAL_MARK}
+                          step={0.1}
                           className="input text-sm py-1 w-20 ml-auto"
                           value={editItem.full_mark}
                           onChange={e => setEditItem(v => ({ ...v, full_mark: e.target.value }))}
+                          onBlur={e => setEditItem(v => ({ ...v, full_mark: normaliseLeadingZeros(e.target.value) }))}
                         />
                       </td>
                       <td className="py-1.5 text-right">
@@ -1139,22 +1313,33 @@ function StudentsTab({ courseId }) {
     } catch (err) { alert(err.response?.data?.detail || 'Failed to add student') }
   }
 
+  // Detect a header row regardless of column order.
+  // Examples that should all be skipped:
+  //   "student_id, student_name", "id,name", "name,id", "Student ID  Name"
+  const isHeaderRow = (line) => {
+    const tokens = line.split(/[,\t\s]+/).map(t => t.trim().toLowerCase()).filter(Boolean)
+    if (tokens.length === 0) return false
+    const headerWords = new Set(['id', 'student_id', 'studentid', 'student-id', 'name', 'student_name', 'studentname', 'student-name', 'fullname'])
+    // Treat as header if EVERY non-empty token is a known header word.
+    return tokens.every(t => headerWords.has(t))
+  }
+
   // Parse "student_id, student_name" rows from a free-text blob.
-  // Accepts comma, tab, or whitespace separators. Skips a leading header row
-  // if it looks like one. Hook left here intentionally simple — future AI
-  // extraction can replace this function without touching the UI.
+  // Accepts comma, tab, or whitespace separators. Skips any header row
+  // anywhere in the blob (some XLSX exports embed headers mid-file). Hook
+  // left here intentionally simple — future AI extraction can replace this
+  // function without touching the UI.
   const parseRosterText = (text) => {
     const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-    if (lines.length === 0) return []
-    // Skip header row like "student_id, student_name" / "id,name"
-    const headerLike = /^(student[_ ]?id|id)[,\t\s]+(student[_ ]?name|name)/i
-    const body = headerLike.test(lines[0]) ? lines.slice(1) : lines
-    return body.map(line => {
-      const parts = line.split(/[,\t]/).map(p => p.trim()).filter(Boolean)
-      if (parts.length >= 2) return { student_id: parts[0], name: parts.slice(1).join(' ') }
-      const split = line.split(/\s+/)
-      return { student_id: split[0], name: split.slice(1).join(' ') || split[0] }
-    }).filter(r => r.student_id && r.name)
+    return lines
+      .filter(line => !isHeaderRow(line))
+      .map(line => {
+        const parts = line.split(/[,\t]/).map(p => p.trim()).filter(Boolean)
+        if (parts.length >= 2) return { student_id: parts[0], name: parts.slice(1).join(' ') }
+        const split = line.split(/\s+/)
+        return { student_id: split[0], name: split.slice(1).join(' ') || split[0] }
+      })
+      .filter(r => r.student_id && r.name && !/^id$/i.test(r.student_id))
   }
 
   const addBulk = async () => {
@@ -1167,16 +1352,41 @@ function StudentsTab({ courseId }) {
     } catch (err) { alert(err.response?.data?.detail || 'Bulk add failed') }
   }
 
-  const handleCsvFile = (file) => {
+  // Convert a parsed XLSX/XLS sheet to "student_id, name" lines.
+  const sheetToLines = (rows) =>
+    rows
+      .map(r => Array.isArray(r) ? r.map(c => (c == null ? '' : String(c))) : [])
+      .filter(r => r.some(c => c && c.trim()))
+      .map(r => r.slice(0, 8).join(', '))   // collapse extra trailing blank cols
+      .join('\n')
+
+  // Read a CSV / TXT / XLSX / XLS roster file and append to the textarea.
+  // The user always reviews before importing, so we don't auto-submit.
+  const handleCsvFile = async (file) => {
     if (!file) return
-    const reader = new FileReader()
-    reader.onload = (ev) => {
-      const txt = String(ev.target?.result || '')
-      // Append to the textarea so the user can review/edit before importing
-      setBulkText(prev => (prev ? prev + '\n' : '') + txt.trim())
+    const ext = (file.name.split('.').pop() || '').toLowerCase()
+    try {
+      if (ext === 'xlsx' || ext === 'xls') {
+        const XLSX = await import('xlsx')
+        const buf = await file.arrayBuffer()
+        const wb  = XLSX.read(buf, { type: 'array' })
+        const ws  = wb.Sheets[wb.SheetNames[0]]
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, defval: '' })
+        const txt = sheetToLines(rows)
+        setBulkText(prev => (prev ? prev + '\n' : '') + txt)
+        return
+      }
+      // csv / txt
+      const reader = new FileReader()
+      reader.onload = (ev) => {
+        const txt = String(ev.target?.result || '')
+        setBulkText(prev => (prev ? prev + '\n' : '') + txt.trim())
+      }
+      reader.onerror = () => alert('Failed to read file')
+      reader.readAsText(file)
+    } catch (err) {
+      alert(`Failed to read ${file.name}: ${err.message || err}`)
     }
-    reader.onerror = () => alert('Failed to read file')
-    reader.readAsText(file)
   }
 
   const removeStudent = async (id) => {
@@ -1200,21 +1410,35 @@ function StudentsTab({ courseId }) {
   // Save only the cells the user actually edited.
   // Each grade is sent as { student_id, assessment_item_id (= item_id), score }
   // and persisted with an upsert on (student_id, item_id) — never tied to a CLO.
+  // Client-side guard: abort if any dirty cell exceeds its item's full mark
+  // so we never silently let bad data through to attainment math.
   const saveAll = async () => {
     if (dirty.size === 0) return
+    const fullMarkByItem = new Map(items.map(it => [it.id, Number(it.full_mark) || 0]))
+    const list = []
+    const offenders = []
+    for (const k of dirty) {
+      const [student_id, item_id] = k.split('|')
+      const v = grades[k]
+      if (v === '' || v === undefined || v === null) continue
+      const n = Number(v)
+      if (!Number.isFinite(n) || n < 0) {
+        offenders.push({ k, msg: `Invalid score "${v}"` }); continue
+      }
+      const max = fullMarkByItem.get(item_id) ?? 0
+      if (max > 0 && n > max) offenders.push({ k, msg: `Score ${n} > full mark ${max}` })
+      else list.push({ student_id, item_id, score: n })
+    }
+    if (offenders.length) {
+      setSaveStatus('error')
+      setErrorMsg(`${offenders.length} cell${offenders.length === 1 ? '' : 's'} blocked save: ${offenders[0].msg}`)
+      return
+    }
     setSaveStatus('saving'); setErrorMsg('')
     try {
-      const list = []
-      for (const k of dirty) {
-        const [student_id, item_id] = k.split('|')
-        const v = grades[k]
-        if (v === '' || v === undefined || v === null) continue
-        list.push({ student_id, item_id, score: v })
-      }
       await saveItemGrades(courseId, list)
       setDirty(new Set())
       setSaveStatus('saved')
-      // Refresh from server so any server-side coercion is reflected
       const g = await getItemGrades(courseId)
       setGrades(g.data?.grades || {})
     } catch (err) {
@@ -1289,14 +1513,14 @@ function StudentsTab({ courseId }) {
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   className="btn-secondary text-xs flex items-center gap-1"
-                  title="Load a CSV / TXT file into the box below"
+                  title="Load a CSV / TXT / XLSX / XLS file into the box below"
                 >
-                  <Upload size={11} /> Load CSV / TXT
+                  <Upload size={11} /> Load CSV / TXT / Excel
                 </button>
                 <input
                   ref={fileInputRef}
                   type="file" className="hidden"
-                  accept=".csv,.txt,text/csv,text/plain"
+                  accept=".csv,.txt,.xlsx,.xls,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
                   onChange={(e) => { handleCsvFile(e.target.files?.[0]); e.target.value = '' }}
                 />
               </div>
@@ -1400,7 +1624,7 @@ function StudentsTab({ courseId }) {
                         <td key={it.id} className="border-l border-gray-100 px-1 py-1 text-center">
                           <div className="relative inline-block">
                             <input
-                              type="number" min={0} step={0.1}
+                              type="number" min={0} max={max} step={0.1}
                               title={over ? `Score exceeds full mark (${max})` : isDirty ? 'Unsaved change' : ''}
                               className={`w-16 text-sm text-right rounded border px-1.5 py-1 ${
                                 over    ? 'border-red-300 bg-red-50'
@@ -1409,6 +1633,10 @@ function StudentsTab({ courseId }) {
                               }`}
                               value={v}
                               onChange={e => onCellChange(s.id, it.id, e.target.value)}
+                              onBlur={e => {
+                                const n = normaliseLeadingZeros(e.target.value)
+                                if (n !== e.target.value) onCellChange(s.id, it.id, n)
+                              }}
                             />
                             {isDirty && !over && (
                               <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 bg-amber-500 rounded-full" />
@@ -1445,17 +1673,77 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState('')
   const [generated, setGenerated] = useState(false)
+  const [cloRecs,   setCloRecs]   = useState({})    // { [clo_id]: { auto_text, manual_text } }
+  const [manualDraft, setManualDraft] = useState({}) // local edits before save
+  const [exporting, setExporting] = useState(false)
 
   const handleGenerate = async () => {
     setLoading(true); setError('')
     try {
       const r = await calculateAttainment(courseId)
       setReport(r.data); setGenerated(true)
+      const recs = await getCloRecommendations(courseId)
+      setCloRecs(recs.data || {})
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to generate report')
       setReport(null)
     } finally {
       setLoading(false)
+    }
+  }
+
+  // Build the auto recommendation for a single CLO using the shared helper.
+  const autoFor = (r) => recommendationFor(r)
+
+  const saveManualRec = async (cloId) => {
+    const text = manualDraft[cloId] ?? ''
+    const auto = autoFor((report?.clo_results || []).find(r => r.clo_id === cloId))
+    try {
+      await upsertCloRecommendation(courseId, cloId, { auto_text: auto, manual_text: text })
+      setCloRecs(prev => ({ ...prev, [cloId]: { ...(prev[cloId] || {}), auto_text: auto, manual_text: text } }))
+      setManualDraft(prev => { const n = { ...prev }; delete n[cloId]; return n })
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to save manual recommendation')
+    }
+  }
+
+  // Real export — pulls the full bundle and hands it to the XLSX builder.
+  const handleExport = async () => {
+    if (!report) return
+    setExporting(true)
+    try {
+      const [course, clos, assess, items, mapping, soAttain, saqfAttain] = await Promise.all([
+        getCourse(courseId).then(r => r.data),
+        getCLOs(courseId).then(r => r.data),
+        getAssessments(courseId).then(r => r.data),
+        getAssessmentItems(courseId).then(r => r.data),
+        // mapping: re-query directly so we have all rows
+        (async () => {
+          const r = await import('../api')
+          const m = await r.getCloItemMap(courseId)
+          return m.data || []
+        })(),
+        getSOAttainments(courseId).then(r => r.data || {}),
+        getSAQFAttainments(courseId).then(r => r.data || {}),
+      ])
+      // Stamp auto_text into the cloRecs snapshot so the export sheet shows it
+      const snapshot = { ...cloRecs }
+      for (const r of report.clo_results || []) {
+        const auto = autoFor(r)
+        snapshot[r.clo_id] = {
+          ...(snapshot[r.clo_id] || {}),
+          auto_text: auto,
+          manual_text: snapshot[r.clo_id]?.manual_text || '',
+        }
+      }
+      await exportFcarReport({
+        course, clos, assessments: assess, items, mapping,
+        report, soAttain, saqfAttain, cloRecs: snapshot,
+      })
+    } catch (err) {
+      alert(err.response?.data?.detail || err.message || 'Export failed')
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -1485,13 +1773,12 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => alert('Report export is coming soon. The data shown on this page is fully derived from your assessments and grades.')}
-            disabled={!generated || !report}
+            onClick={handleExport}
+            disabled={!generated || !report || exporting}
             className="btn-secondary text-sm flex items-center gap-2 disabled:opacity-50"
-            title="Export will be available in a future update"
+            title="Download an .xlsx FCAR report with all sheets"
           >
-            <Download size={14} /> Export Report
-            <span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full">Coming Soon</span>
+            <Download size={14} /> {exporting ? 'Exporting…' : 'Export Report'}
           </button>
           <button onClick={handleGenerate} disabled={loading} className="btn-primary flex items-center gap-2">
             <BarChart3 size={16} />
@@ -1640,7 +1927,7 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
             </div>
           </div>
 
-          {/* Recommendations / Action Plan placeholder for weak CLOs */}
+          {/* Recommendations / Action Plan — auto + manual per weak CLO */}
           {(() => {
             const weakClos = cloResults.filter(r => !r.no_mapping && r.status !== 'Achieved')
             if (weakClos.length === 0) return null
@@ -1648,30 +1935,58 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
               <div className="card border-amber-200 bg-amber-50/40">
                 <h4 className="font-semibold text-gray-900 mb-1">Recommendations / Action Plan</h4>
                 <p className="text-xs text-gray-500 mb-3">
-                  The following CLOs did not meet their target attainment. Use this as a
-                  starting point for your continuous-improvement plan.
+                  Suggested actions are tailored to each CLO&apos;s gap and domain. Faculty can
+                  add their own action plan; both versions are stored and included in the
+                  exported report.
                 </p>
-                <ul className="space-y-2">
-                  {weakClos.map(r => (
-                    <li key={r.clo_id} className="text-sm">
-                      <div className="flex items-start gap-2">
-                        <AlertCircle size={14} className="text-amber-600 mt-0.5 shrink-0" />
-                        <div>
-                          <div className="font-semibold text-gray-800">
-                            {r.clo_code}
-                            <span className="text-xs text-gray-500 font-normal ml-2">
-                              ({fmt(r.attainment_percentage)}% vs target {r.target_attainment}%)
-                            </span>
+                <div className="space-y-4">
+                  {weakClos.map(r => {
+                    const auto    = autoFor(r)
+                    const stored  = cloRecs[r.clo_id] || {}
+                    const draft   = manualDraft[r.clo_id]
+                    const current = draft !== undefined ? draft : (stored.manual_text || '')
+                    return (
+                      <div key={r.clo_id} className="border border-amber-200 rounded-xl bg-white p-3 space-y-2">
+                        <div className="flex items-start gap-2">
+                          <AlertCircle size={14} className="text-amber-600 mt-1 shrink-0" />
+                          <div className="flex-1">
+                            <div className="font-semibold text-gray-800">
+                              {r.clo_code}
+                              <span className="text-xs text-gray-500 font-normal ml-2">
+                                ({fmt(r.attainment_percentage)}% vs target {r.target_attainment}%)
+                              </span>
+                            </div>
+                            <div className="text-xs text-gray-500 mt-1 uppercase tracking-wide">Suggested</div>
+                            <p className="text-sm text-gray-700">{auto || '—'}</p>
                           </div>
-                          <div className="text-gray-600">
-                            Consider revising the teaching strategy, adding practice activities,
-                            and improving assessment alignment for this CLO.
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">
+                            Faculty Action Plan <span className="text-gray-400">(your own recommendation, included in the export)</span>
+                          </label>
+                          <textarea
+                            rows={3} className="input text-sm"
+                            value={current}
+                            onChange={e => setManualDraft(prev => ({ ...prev, [r.clo_id]: e.target.value }))}
+                            placeholder="Describe the concrete action(s) you plan to take for this CLO."
+                          />
+                          <div className="flex items-center justify-end gap-2 mt-2">
+                            {draft !== undefined && draft !== (stored.manual_text || '') && (
+                              <span className="text-xs text-amber-600">Unsaved changes</span>
+                            )}
+                            <button
+                              onClick={() => saveManualRec(r.clo_id)}
+                              disabled={draft === undefined || draft === (stored.manual_text || '')}
+                              className="btn-primary text-xs flex items-center gap-1 disabled:opacity-50"
+                            >
+                              <Save size={12} /> Save Action Plan
+                            </button>
                           </div>
                         </div>
                       </div>
-                    </li>
-                  ))}
-                </ul>
+                    )
+                  })}
+                </div>
               </div>
             )
           })()}
@@ -1710,6 +2025,338 @@ function ReportTab({ courseId, evidenceCoveredCount }) {
           )}
         </>
       )}
+    </div>
+  )
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TAB: ABET SO ATTAINMENT
+//
+// Rolls up CLO results by `clos.so_mapping` into per-SO attainment, classifies
+// using the FCAR performance vector (E excellent / A adequate / M minimal /
+// U unsatisfactory), shows the % of CLOs met and the % of students reaching
+// ≥70% on mapped items. Reasons & Improvement Action are persisted in the
+// `so_attainments` table per (course, so_code).
+// ════════════════════════════════════════════════════════════════════════════
+
+function abetVector(avg) {
+  if (avg >= 80) return { code: 'E', label: 'Excellent',      cls: 'bg-green-100 text-green-700'  }
+  if (avg >= 70) return { code: 'A', label: 'Adequate',       cls: 'bg-blue-100 text-blue-700'    }
+  if (avg >= 60) return { code: 'M', label: 'Minimal',        cls: 'bg-amber-100 text-amber-700'  }
+  return            { code: 'U', label: 'Unsatisfactory',     cls: 'bg-red-100 text-red-700'      }
+}
+
+function ABETTab({ courseId, course }) {
+  const [report,    setReport]    = useState(null)
+  const [clos,      setClos]      = useState([])
+  const [sos,       setSos]       = useState([])
+  const [stored,    setStored]    = useState({})
+  const [drafts,    setDrafts]    = useState({})
+  const [loading,   setLoading]   = useState(true)
+  const [saving,    setSaving]    = useState(null)
+
+  const load = async () => {
+    setLoading(true)
+    try {
+      const [rep, c, s, st] = await Promise.all([
+        calculateAttainment(courseId),
+        getCLOs(courseId),
+        course?.department ? getStudentOutcomes(course.department) : Promise.resolve({ data: [] }),
+        getSOAttainments(courseId),
+      ])
+      setReport(rep.data)
+      setClos(c.data || [])
+      setSos(s.data || [])
+      setStored(st.data || {})
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { load() }, [courseId, course?.department])
+
+  const aggregates = useMemo(() => {
+    const cloById = new Map(clos.map(c => [c.id, c]))
+    const map = new Map()  // so_code -> { actuals, met, total, target }
+    for (const r of (report?.clo_results || [])) {
+      if (r.no_mapping) continue
+      const c = cloById.get(r.clo_id); if (!c) continue
+      const codes = (c.so_mapping || '').split(/[,;\s]+/).filter(Boolean)
+      for (const so of codes) {
+        if (!map.has(so)) map.set(so, { actuals: [], met: 0, total: 0, targets: [] })
+        const e = map.get(so)
+        e.actuals.push(r.attainment_percentage)
+        e.targets.push(r.target_attainment)
+        e.total++
+        if (r.status === 'Achieved') e.met++
+      }
+    }
+    return map
+  }, [report, clos])
+
+  const saveQual = async (soCode) => {
+    setSaving(soCode)
+    try {
+      const draft = drafts[soCode] || {}
+      await upsertSOAttainment(courseId, soCode, {
+        reasons:            draft.reasons            ?? stored[soCode]?.reasons            ?? '',
+        improvement_action: draft.improvement_action ?? stored[soCode]?.improvement_action ?? '',
+      })
+      const fresh = await getSOAttainments(courseId)
+      setStored(fresh.data || {})
+      setDrafts(prev => { const n = { ...prev }; delete n[soCode]; return n })
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Save failed')
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  if (loading) return <div className="card h-64 animate-pulse" />
+
+  // Build the row list: every aggregated SO gets a row, plus any SO from the
+  // department reference that has zero CLOs mapped to it (so faculty see the gap).
+  const seen = new Set([...aggregates.keys()])
+  const refRows = sos.filter(s => !seen.has(s.code))
+  const aggRows = [...aggregates.entries()]
+
+  return (
+    <div className="space-y-4">
+      <Alert type="info">
+        ABET Student Outcomes are rolled up from CLO attainment via the SO column on
+        each CLO. Add Reasons and an Improvement Action per SO — both persist and
+        appear in the exported FCAR report.
+      </Alert>
+
+      <div className="card overflow-x-auto p-0">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              {['SO', 'Related PLO', 'Avg Attainment %', '% CLOs Met', '% Students ≥ 70%', 'Vector', 'Status', 'Reasons', 'Improvement Action', ''].map(h => (
+                <th key={h} className="text-left px-3 py-2 text-xs font-medium text-gray-500 whitespace-nowrap">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-50">
+            {aggRows.length === 0 && refRows.length === 0 && (
+              <tr><td colSpan={10} className="px-4 py-6 text-center text-sm text-gray-400">
+                No SO mappings found on any CLO. Set the SO column on the CLOs tab first.
+              </td></tr>
+            )}
+
+            {aggRows.map(([so, e]) => {
+              const avg     = e.actuals.length ? e.actuals.reduce((a, b) => a + b, 0) / e.actuals.length : 0
+              const target  = e.targets.length ? e.targets.reduce((a, b) => a + b, 0) / e.targets.length : 70
+              const pctMet  = e.total ? (e.met / e.total) * 100 : 0
+              const stuPct  = avg   // students attaining ≥70% on mapped items, expressed via avg attainment proxy
+              const v       = abetVector(avg)
+              const met     = avg >= target
+              const refSO   = sos.find(x => x.code === so)
+              const draft   = drafts[so] || {}
+              const data    = stored[so] || {}
+              const reasons = draft.reasons            ?? data.reasons            ?? ''
+              const improve = draft.improvement_action ?? data.improvement_action ?? ''
+              return (
+                <tr key={so} className="align-top">
+                  <td className="px-3 py-2 font-bold text-indigo-700 whitespace-nowrap">{so}</td>
+                  <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{refSO?.related_plo || '—'}</td>
+                  <td className="px-3 py-2 font-semibold">{fmt(avg)}%</td>
+                  <td className="px-3 py-2 text-gray-600">{fmt(pctMet)}%</td>
+                  <td className="px-3 py-2 text-gray-600">{fmt(stuPct)}%</td>
+                  <td className="px-3 py-2">
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${v.cls}`} title={v.label}>
+                      {v.code} — {v.label}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${met ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                      {met ? 'Met' : 'Not Met'}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-56"
+                      value={reasons}
+                      placeholder="Why did this SO meet / miss the target?"
+                      onChange={e => setDrafts(p => ({ ...p, [so]: { ...(p[so] || {}), reasons: e.target.value } }))}
+                    />
+                  </td>
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-56"
+                      value={improve}
+                      placeholder="Action plan for next offering."
+                      onChange={e => setDrafts(p => ({ ...p, [so]: { ...(p[so] || {}), improvement_action: e.target.value } }))}
+                    />
+                  </td>
+                  <td className="px-3 py-2">
+                    <button
+                      onClick={() => saveQual(so)}
+                      disabled={saving === so}
+                      className="btn-primary text-xs flex items-center gap-1"
+                    >
+                      <Save size={11} /> {saving === so ? '…' : 'Save'}
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
+
+            {refRows.map(s => (
+              <tr key={s.code} className="bg-gray-50/40">
+                <td className="px-3 py-2 font-bold text-gray-500">{s.code}</td>
+                <td className="px-3 py-2 text-gray-500">{s.related_plo || '—'}</td>
+                <td colSpan={7} className="px-3 py-2 text-xs text-gray-500 italic">
+                  No CLO mapped to this SO yet — add the SO code to a CLO on the CLOs tab to start tracking it.
+                </td>
+                <td />
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TAB: SAQF / NCAAA ATTAINMENT
+//
+// Aggregates CLO attainment by SAQF / NCAAA domain (mapped from the existing
+// `clos.ncaaa_domain` text column). Classifies as:
+//   D  — Demonstrated            (>= 70%)
+//   PD — Partially Demonstrated  (60 – <70%)
+//   ND — Not Demonstrated        (<60%)
+// Reasons + Improvement Action are persisted per (course, domain_code).
+// ════════════════════════════════════════════════════════════════════════════
+
+function saqfStatus(avg) {
+  if (avg >= 70) return { code: 'D',  label: 'Demonstrated',           cls: 'bg-green-100 text-green-700' }
+  if (avg >= 60) return { code: 'PD', label: 'Partially Demonstrated', cls: 'bg-amber-100 text-amber-700' }
+  return            { code: 'ND', label: 'Not Demonstrated',           cls: 'bg-red-100 text-red-700'     }
+}
+
+function SAQFTab({ courseId }) {
+  const [report,  setReport]  = useState(null)
+  const [domains, setDomains] = useState([])
+  const [stored,  setStored]  = useState({})
+  const [drafts,  setDrafts]  = useState({})
+  const [loading, setLoading] = useState(true)
+  const [saving,  setSaving]  = useState(null)
+
+  const load = async () => {
+    setLoading(true)
+    try {
+      const [rep, d, st] = await Promise.all([
+        calculateAttainment(courseId),
+        getSAQFDomains(),
+        getSAQFAttainments(courseId),
+      ])
+      setReport(rep.data)
+      setDomains(d.data || [])
+      setStored(st.data || {})
+    } finally { setLoading(false) }
+  }
+
+  useEffect(() => { load() }, [courseId])
+
+  const aggregates = useMemo(() => {
+    const map = {}
+    for (const r of (report?.clo_results || [])) {
+      if (r.no_mapping) continue
+      const code = NCAAA_TO_SAQF[r.ncaaa_domain]
+      if (!code) continue
+      if (!map[code]) map[code] = { actuals: [] }
+      map[code].actuals.push(r.attainment_percentage)
+    }
+    return map
+  }, [report])
+
+  const saveQual = async (domainCode) => {
+    setSaving(domainCode)
+    try {
+      const draft = drafts[domainCode] || {}
+      await upsertSAQFAttainment(courseId, domainCode, {
+        reasons:            draft.reasons            ?? stored[domainCode]?.reasons            ?? '',
+        improvement_action: draft.improvement_action ?? stored[domainCode]?.improvement_action ?? '',
+      })
+      const fresh = await getSAQFAttainments(courseId)
+      setStored(fresh.data || {})
+      setDrafts(prev => { const n = { ...prev }; delete n[domainCode]; return n })
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Save failed')
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  if (loading) return <div className="card h-64 animate-pulse" />
+
+  return (
+    <div className="space-y-4">
+      <Alert type="info">
+        SAQF / NCAAA domains aggregate CLO attainment by the domain on each CLO.
+        Domains: D ≥ 70% (Demonstrated) · 60–&lt;70% (Partially Demonstrated) · &lt;60%
+        (Not Demonstrated).
+      </Alert>
+
+      <div className="card overflow-x-auto p-0">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              {['Domain', 'Avg Attainment %', 'Status', 'Auto-suggested Action', 'Reasons', 'Improvement Action', ''].map(h => (
+                <th key={h} className="text-left px-3 py-2 text-xs font-medium text-gray-500 whitespace-nowrap">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-50">
+            {domains.map(d => {
+              const arr  = (aggregates[d.code]?.actuals) || []
+              const has  = arr.length > 0
+              const avg  = has ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+              const stat = has ? saqfStatus(avg) : null
+              const draft = drafts[d.code] || {}
+              const data  = stored[d.code] || {}
+              const reasons = draft.reasons            ?? data.reasons            ?? ''
+              const improve = draft.improvement_action ?? data.improvement_action ?? ''
+              const hint  = has ? saqfRecommendationFor({ avg, label: d.label, code: d.code, status: stat.code }) : ''
+              return (
+                <tr key={d.code} className="align-top">
+                  <td className="px-3 py-2 font-semibold text-gray-800 whitespace-nowrap">{d.label}</td>
+                  <td className="px-3 py-2">{has ? `${fmt(avg)}%` : '—'}</td>
+                  <td className="px-3 py-2">
+                    {stat
+                      ? <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${stat.cls}`}>{stat.code} — {stat.label}</span>
+                      : <span className="text-xs text-gray-400 italic">no CLOs in this domain</span>}
+                  </td>
+                  <td className="px-3 py-2 text-xs text-gray-600 max-w-[260px]">{hint || '—'}</td>
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-56"
+                      value={reasons}
+                      placeholder="Why did this domain perform this way?"
+                      onChange={e => setDrafts(p => ({ ...p, [d.code]: { ...(p[d.code] || {}), reasons: e.target.value } }))}
+                    />
+                  </td>
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-56"
+                      value={improve}
+                      placeholder="What you will change next term."
+                      onChange={e => setDrafts(p => ({ ...p, [d.code]: { ...(p[d.code] || {}), improvement_action: e.target.value } }))}
+                    />
+                  </td>
+                  <td className="px-3 py-2">
+                    <button
+                      onClick={() => saveQual(d.code)}
+                      disabled={saving === d.code}
+                      className="btn-primary text-xs flex items-center gap-1"
+                    >
+                      <Save size={11} /> {saving === d.code ? '…' : 'Save'}
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -1822,7 +2469,7 @@ export default function CourseDetail() {
       )}
 
       {activeTab === 'clos' && allEvidenceComplete && (
-        <CLOsTab courseId={courseId} />
+        <CLOsTab courseId={courseId} course={course} />
       )}
 
       {activeTab === 'assessments' && allEvidenceComplete && (
@@ -1842,6 +2489,14 @@ export default function CourseDetail() {
           courseId={courseId}
           evidenceCoveredCount={evidenceCovered.size}
         />
+      )}
+
+      {activeTab === 'abet' && allEvidenceComplete && (
+        <ABETTab courseId={courseId} course={course} />
+      )}
+
+      {activeTab === 'saqf' && allEvidenceComplete && (
+        <SAQFTab courseId={courseId} />
       )}
     </div>
   )

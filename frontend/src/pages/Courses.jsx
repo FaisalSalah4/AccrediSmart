@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import { Plus, BookOpen, Trash2, X, ChevronRight, ChevronDown, ChevronUp } from 'lucide-react'
+import { Plus, BookOpen, Trash2, X, ChevronRight, ChevronDown, ChevronUp, Upload, FileText, Type } from 'lucide-react'
 import { getCourses, createCourse, deleteCourse } from '../api'
 import { DEPARTMENTS } from '../constants'
+import { parseCourseDoc } from '../lib/parseCourseDoc'
 
 const SEMESTERS    = ['Fall', 'Spring', 'Summer']
 const CURRENT_YEAR = new Date().getFullYear()
@@ -19,8 +20,36 @@ function CourseModal({ onSave, onClose }) {
   const [form, setForm]       = useState(EMPTY)
   const [loading, setLoading] = useState(false)
   const [error, setError]     = useState('')
+  // Mode: 'manual' (default) or 'upload' (PDF/DOCX → auto-fill)
+  const [mode, setMode]       = useState('manual')
+  const [parsing, setParsing] = useState(false)
+  const [parsedFrom, setParsedFrom] = useState('')
+  const fileRef               = useRef()
 
   const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target.value }))
+
+  const handleFile = async (file) => {
+    if (!file) return
+    setError(''); setParsing(true); setParsedFrom('')
+    try {
+      const { fields } = await parseCourseDoc(file)
+      // Merge non-empty parsed values into the form. Empty parsed fields are
+      // left alone so the user's previous typing is preserved.
+      setForm(prev => {
+        const next = { ...prev }
+        for (const [k, v] of Object.entries(fields || {})) {
+          if (v !== undefined && v !== null && v !== '') next[k] = v
+        }
+        return next
+      })
+      setParsedFrom(file.name)
+      setMode('manual')   // hand the user back to the form for review
+    } catch (err) {
+      setError(err.message || 'Failed to parse document')
+    } finally {
+      setParsing(false)
+    }
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -44,8 +73,65 @@ function CourseModal({ onSave, onClose }) {
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
         </div>
 
+        {/* Mode toggle: manual vs file upload */}
+        <div className="px-6 pt-4">
+          <div className="inline-flex bg-gray-100 rounded-lg p-0.5 text-xs">
+            <button
+              type="button"
+              onClick={() => setMode('manual')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md transition ${
+                mode === 'manual' ? 'bg-white shadow-sm text-indigo-700 font-semibold' : 'text-gray-600'
+              }`}
+            >
+              <Type size={12} /> Manual entry
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('upload')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md transition ${
+                mode === 'upload' ? 'bg-white shadow-sm text-indigo-700 font-semibold' : 'text-gray-600'
+              }`}
+            >
+              <FileText size={12} /> Upload course file
+            </button>
+          </div>
+        </div>
+
+        {mode === 'upload' && (
+          <div className="px-6 pt-4">
+            <div className="border-2 border-dashed border-gray-200 rounded-xl p-6 text-center bg-gray-50">
+              <Upload size={28} className="mx-auto mb-2 text-gray-400" />
+              <p className="text-sm text-gray-700">
+                Upload a course-information file (PDF or .docx).
+              </p>
+              <p className="text-xs text-gray-500 mt-1">
+                We&apos;ll try to extract <strong>code</strong>, <strong>name</strong>, <strong>credit hours</strong>,
+                <strong> department</strong>, <strong>semester</strong> and <strong>year</strong>. You can review and edit before saving.
+              </p>
+              <button
+                type="button"
+                onClick={() => fileRef.current?.click()}
+                disabled={parsing}
+                className="btn-primary text-sm mt-3 inline-flex items-center gap-2"
+              >
+                <Upload size={14} /> {parsing ? 'Parsing…' : 'Choose file'}
+              </button>
+              <input
+                ref={fileRef} type="file" className="hidden"
+                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                onChange={(e) => { handleFile(e.target.files?.[0]); e.target.value = '' }}
+              />
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
           {error && <div className="bg-red-50 text-red-700 text-sm rounded-lg px-3 py-2">{error}</div>}
+          {parsedFrom && (
+            <div className="bg-indigo-50 text-indigo-700 text-xs rounded-lg px-3 py-2 border border-indigo-100">
+              Pre-filled from <strong>{parsedFrom}</strong>. Please review every field below before saving.
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <div>

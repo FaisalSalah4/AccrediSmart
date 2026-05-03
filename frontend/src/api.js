@@ -177,10 +177,137 @@ export const getCLOs = async (courseId) => {
   return { data }
 }
 
-/** Only target_attainment and passing_score are updatable by faculty */
+/**
+ * Update a CLO. target_attainment and passing_score are admin-only — we
+ * check the current user's profile role and raise a friendly error if a
+ * non-admin tries to change those fields. Defense-in-depth is provided by
+ * an RLS WITH CHECK policy in supabase_fcar_v2_schema.sql.
+ */
 export const updateCLO = async (cloId, cloData) => {
+  const wantsThresholdChange =
+    cloData.target_attainment !== undefined || cloData.passing_score !== undefined
+  if (wantsThresholdChange) {
+    const profile = await myProfile()
+    if (profile?.role !== 'admin') {
+      raise({ message: 'Only an administrator can change Target Attainment or Passing Score.' })
+    }
+  }
   const { data, error } = await supabase
     .from('clos').update(cloData).eq('id', cloId).select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FCAR v2 — DB-driven PLO / SO / SAQF reference + per-course rec & attainment
+// (Tables defined in supabase_fcar_v2_schema.sql)
+// ════════════════════════════════════════════════════════════════════════════
+
+export const getProgramOutcomes = async (department) => {
+  const { data, error } = await supabase
+    .from('program_outcomes').select('*').eq('department', department).order('position')
+  if (error) raise(error)
+  return { data }
+}
+
+export const getStudentOutcomes = async (department) => {
+  const { data, error } = await supabase
+    .from('student_outcomes').select('*').eq('department', department).order('position')
+  if (error) raise(error)
+  return { data }
+}
+
+export const getSAQFDomains = async () => {
+  const { data, error } = await supabase
+    .from('saqf_domains').select('*').order('position')
+  if (error) raise(error)
+  return { data }
+}
+
+// ── CLO Recommendations ─────────────────────────────────────────────────────
+
+export const getCloRecommendations = async (courseId) => {
+  const { data, error } = await supabase
+    .from('clo_recommendations').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  // Return as a map keyed by clo_id for convenience
+  const byClo = {}
+  for (const r of (data || [])) byClo[r.clo_id] = r
+  return { data: byClo }
+}
+
+export const upsertCloRecommendation = async (courseId, cloId, payload) => {
+  const id = await uid()
+  const row = {
+    course_id:   courseId,
+    clo_id:      cloId,
+    auto_text:   payload.auto_text   ?? null,
+    manual_text: payload.manual_text ?? null,
+    updated_by:  id,
+    updated_at:  new Date().toISOString(),
+  }
+  const { data, error } = await supabase
+    .from('clo_recommendations')
+    .upsert(row, { onConflict: 'course_id,clo_id' })
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── ABET SO Attainments (qualitative reasons + improvement action) ──────────
+
+export const getSOAttainments = async (courseId) => {
+  const { data, error } = await supabase
+    .from('so_attainments').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  const byCode = {}
+  for (const r of (data || [])) byCode[r.so_code] = r
+  return { data: byCode }
+}
+
+export const upsertSOAttainment = async (courseId, soCode, payload) => {
+  const id = await uid()
+  const row = {
+    course_id:          courseId,
+    so_code:            soCode,
+    reasons:            payload.reasons            ?? null,
+    improvement_action: payload.improvement_action ?? null,
+    updated_by:         id,
+    updated_at:         new Date().toISOString(),
+  }
+  const { data, error } = await supabase
+    .from('so_attainments')
+    .upsert(row, { onConflict: 'course_id,so_code' })
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── SAQF / NCAAA Attainments ────────────────────────────────────────────────
+
+export const getSAQFAttainments = async (courseId) => {
+  const { data, error } = await supabase
+    .from('saqf_attainments').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  const byCode = {}
+  for (const r of (data || [])) byCode[r.domain_code] = r
+  return { data: byCode }
+}
+
+export const upsertSAQFAttainment = async (courseId, domainCode, payload) => {
+  const id = await uid()
+  const row = {
+    course_id:          courseId,
+    domain_code:        domainCode,
+    reasons:            payload.reasons            ?? null,
+    improvement_action: payload.improvement_action ?? null,
+    updated_by:         id,
+    updated_at:         new Date().toISOString(),
+  }
+  const { data, error } = await supabase
+    .from('saqf_attainments')
+    .upsert(row, { onConflict: 'course_id,domain_code' })
+    .select().single()
   if (error) raise(error)
   return { data }
 }
@@ -230,15 +357,30 @@ export const getAssessments = async (courseId) => {
   return { data }
 }
 
+// ── Numeric guards (server-side defense matching the UI rules) ─────────────
+const MAX_TOTAL_MARK = 1000   // cap on assessment.total_mark
+const MAX_WEIGHT     = 100    // course weight is a percentage
+
+function validateMark(label, raw, max, { allowZero = true } = {}) {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) raise({ message: `${label} must be a number.` })
+  if (n < 0)               raise({ message: `${label} cannot be negative.` })
+  if (!allowZero && n === 0) raise({ message: `${label} must be greater than 0.` })
+  if (n > max)             raise({ message: `${label} (${n}) exceeds the allowed maximum of ${max}.` })
+  return n
+}
+
 export const createAssessment = async (courseId, payload) => {
+  const weight    = validateMark('Course weight %', payload.weight,     MAX_WEIGHT)
+  const totalMark = validateMark('Assessment total mark', payload.total_mark, MAX_TOTAL_MARK)
   const { data, error } = await supabase
     .from('assessments')
     .insert({
       course_id:  courseId,
       name:       payload.name,
       type:       payload.type,
-      weight:     Number(payload.weight)     || 0,
-      total_mark: Number(payload.total_mark) || 0,
+      weight,
+      total_mark: totalMark,
     })
     .select().single()
   if (error) raise(error)
@@ -246,13 +388,15 @@ export const createAssessment = async (courseId, payload) => {
 }
 
 export const updateAssessment = async (assessmentId, payload) => {
+  const weight    = validateMark('Course weight %', payload.weight,     MAX_WEIGHT)
+  const totalMark = validateMark('Assessment total mark', payload.total_mark, MAX_TOTAL_MARK)
   const { data, error } = await supabase
     .from('assessments')
     .update({
       name:       payload.name,
       type:       payload.type,
-      weight:     Number(payload.weight)     || 0,
-      total_mark: Number(payload.total_mark) || 0,
+      weight,
+      total_mark: totalMark,
     })
     .eq('id', assessmentId)
     .select().single()
@@ -283,8 +427,40 @@ export const getAssessmentItems = async (courseId) => {
   return { data }
 }
 
+/** Item full_mark must not exceed the parent assessment's total_mark — guard
+ *  here so a bad value cannot poison later attainment math. */
+async function assertItemMarkValid(assessmentId, fullMark, ignoreItemId = null) {
+  const fm = validateMark('Item full mark', fullMark, MAX_TOTAL_MARK, { allowZero: false })
+
+  const { data: a, error: aErr } = await supabase
+    .from('assessments').select('total_mark').eq('id', assessmentId).single()
+  if (aErr) raise(aErr)
+  const total = Number(a?.total_mark) || 0
+
+  if (total > 0 && fm > total) {
+    raise({ message: `Item full mark (${fm}) cannot exceed assessment total (${total}).` })
+  }
+
+  // Σ existing items + this new value must also not exceed total.
+  const { data: siblings } = await supabase
+    .from('assessment_items').select('id, full_mark').eq('assessment_id', assessmentId)
+  const siblingSum = (siblings || [])
+    .filter(s => s.id !== ignoreItemId)
+    .reduce((s, it) => s + (Number(it.full_mark) || 0), 0)
+
+  if (total > 0 && siblingSum + fm > total + 0.01) {
+    raise({
+      message:
+        `Sum of item full marks (${siblingSum + fm}) would exceed assessment total (${total}). ` +
+        `Reduce one of the existing items first.`,
+    })
+  }
+
+  return fm
+}
+
 export const createAssessmentItem = async (assessmentId, payload) => {
-  // Compute next position so items render in insertion order.
+  const fm = await assertItemMarkValid(assessmentId, payload.full_mark)
   const { data: existing } = await supabase
     .from('assessment_items').select('position').eq('assessment_id', assessmentId)
   const nextPos = (existing?.length || 0) + 1
@@ -294,7 +470,7 @@ export const createAssessmentItem = async (assessmentId, payload) => {
     .insert({
       assessment_id: assessmentId,
       name:          payload.name,
-      full_mark:     Number(payload.full_mark) || 0,
+      full_mark:     fm,
       position:      nextPos,
     })
     .select().single()
@@ -303,9 +479,13 @@ export const createAssessmentItem = async (assessmentId, payload) => {
 }
 
 export const updateAssessmentItem = async (itemId, payload) => {
+  const { data: existing, error: exErr } = await supabase
+    .from('assessment_items').select('assessment_id').eq('id', itemId).single()
+  if (exErr) raise(exErr)
+  const fm = await assertItemMarkValid(existing.assessment_id, payload.full_mark, itemId)
   const { data, error } = await supabase
     .from('assessment_items')
-    .update({ name: payload.name, full_mark: Number(payload.full_mark) || 0 })
+    .update({ name: payload.name, full_mark: fm })
     .eq('id', itemId)
     .select().single()
   if (error) raise(error)
@@ -390,13 +570,42 @@ export const getItemGrades = async (courseId) => {
 }
 
 export const saveItemGrades = async (_courseId, gradeList) => {
-  const rows = gradeList
+  const filtered = gradeList
     .filter(g => g.score !== '' && g.score !== null && g.score !== undefined)
-    .map(g => ({
-      student_id: g.student_id,
-      item_id:    g.item_id,
-      score:      Number(g.score),
-    }))
+
+  // Validate scores against each item's full_mark before any upsert. This is
+  // the "no mismatch between Students & Grades and the report" guarantee.
+  if (filtered.length > 0) {
+    const itemIds = [...new Set(filtered.map(g => g.item_id))]
+    const { data: itemRows, error: iErr } = await supabase
+      .from('assessment_items').select('id, name, full_mark').in('id', itemIds)
+    if (iErr) raise(iErr)
+    const fullMarkById = new Map((itemRows || []).map(r => [r.id, Number(r.full_mark) || 0]))
+
+    const offenders = []
+    for (const g of filtered) {
+      const n = Number(g.score)
+      if (!Number.isFinite(n) || n < 0) {
+        raise({ message: `Score must be a non-negative number (got "${g.score}").` })
+      }
+      const max = fullMarkById.get(g.item_id) ?? 0
+      if (max > 0 && n > max) offenders.push({ ...g, max })
+    }
+    if (offenders.length) {
+      const first = offenders[0]
+      raise({
+        message:
+          `Score (${first.score}) exceeds the item's full mark (${first.max}). ` +
+          `Fix ${offenders.length} cell${offenders.length === 1 ? '' : 's'} highlighted in red and try again.`,
+      })
+    }
+  }
+
+  const rows = filtered.map(g => ({
+    student_id: g.student_id,
+    item_id:    g.item_id,
+    score:      Number(g.score),
+  }))
   if (rows.length === 0) return { data: { message: 'No grades to save' } }
 
   const { error } = await supabase
