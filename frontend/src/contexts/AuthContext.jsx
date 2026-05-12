@@ -12,11 +12,18 @@ export function AuthProvider({ children }) {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user ?? null)
       setLoading(false)
+    }).catch(() => {
+      setUser(null)
+      setLoading(false)
     })
 
-    // Keep user state in sync with Supabase auth events
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null)
+    // Keep user state in sync with Supabase auth events (handles TOKEN_REFRESHED, SIGNED_OUT, etc.)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT') {
+        setUser(null)
+      } else {
+        setUser(session?.user ?? null)
+      }
     })
 
     return () => subscription.unsubscribe()

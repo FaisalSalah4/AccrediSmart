@@ -8,7 +8,8 @@ import Courses from './pages/Courses'
 import CourseDetail from './pages/CourseDetail'
 
 function PrivateRoute({ children }) {
-  const { user } = useAuth()
+  const { user, loading } = useAuth()
+  if (loading) return null   // wait for session check before redirecting
   return user ? children : <Navigate to="/login" replace />
 }
 

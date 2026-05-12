@@ -1,8 +1,5 @@
 /**
  * AccrediSmart — Supabase API layer
- *
- * All functions return { data } (or throw) so component code
- * using .then(r => r.data) continues to work unchanged.
  */
 
 import { supabase } from './lib/supabase'
@@ -169,8 +166,12 @@ export const getCLOs = async (courseId) => {
   return { data }
 }
 
-/** Only target_attainment and passing_score are updatable by faculty */
+/** Admin-only: only admins may adjust target_attainment and passing_score */
 export const updateCLO = async (cloId, cloData) => {
+  const profile = await myProfile()
+  if (profile?.role !== 'admin') {
+    throw { response: { data: { detail: 'Only administrators can adjust CLO thresholds.' } } }
+  }
   const { data, error } = await supabase
     .from('clos').update(cloData).eq('id', cloId).select().single()
   if (error) raise(error)
@@ -179,7 +180,6 @@ export const updateCLO = async (cloId, cloData) => {
 
 // ── Course CLO Templates ──────────────────────────────────────────────────────
 
-/** Fetch CLOs from any existing course that matches the given course code — used as template source */
 export const getCLOTemplateByCode = async (courseCode) => {
   const { data: existingCourses, error: courseError } = await supabase
     .from('courses')
@@ -199,7 +199,6 @@ export const getCLOTemplateByCode = async (courseCode) => {
   return { data }
 }
 
-/** Copy CLO templates into a newly created course */
 export const copyCLOsToNewCourse = async (newCourseId, templateCLOs) => {
   if (!templateCLOs || templateCLOs.length === 0) return { data: [] }
 
@@ -224,7 +223,6 @@ export const copyCLOsToNewCourse = async (newCourseId, templateCLOs) => {
   return { data }
 }
 
-/** Returns true if the current instructor already has this course code in the given semester/year */
 export const checkCourseDuplicate = async (code, semester, year) => {
   const id = await uid()
   const { data, error } = await supabase
@@ -241,7 +239,6 @@ export const checkCourseDuplicate = async (code, semester, year) => {
 
 // ════════════════════════════════════════════════════════════════════════════
 // FCAR WORKFLOW — Students, Assessments, Items, Mapping, Grades
-// (Tables defined in supabase_assessments_schema.sql)
 // ════════════════════════════════════════════════════════════════════════════
 
 // ── Students ─────────────────────────────────────────────────────────────────
@@ -322,7 +319,6 @@ export const deleteAssessment = async (assessmentId) => {
 
 // ── Assessment Items ─────────────────────────────────────────────────────────
 
-/** Returns ALL items for the given course (across every assessment). */
 export const getAssessmentItems = async (courseId) => {
   const { data: assess, error: aErr } = await supabase
     .from('assessments').select('id').eq('course_id', courseId)
@@ -390,7 +386,6 @@ export const getCloItemMap = async (courseId) => {
   return { data }
 }
 
-/** Replaces all mapping rows for this course with the supplied pairs. */
 export const setCloItemMap = async (courseId, pairs) => {
   const { data: current } = await getCloItemMap(courseId)
   const key = (p) => `${p.clo_id}|${p.item_id}`
@@ -415,9 +410,8 @@ export const setCloItemMap = async (courseId, pairs) => {
   return { data: { added: toInsert.length, removed: toDelete.length } }
 }
 
-// ── Item Grades (per student × per assessment item) ──────────────────────────
+// ── Item Grades ──────────────────────────────────────────────────────────────
 
-/** Returns a flat lookup `${studentId}|${itemId}` → score for the whole course. */
 export const getItemGrades = async (courseId) => {
   const [studentsRes, itemsRes] = await Promise.all([
     supabase.from('students').select('id').eq('course_id', courseId),
@@ -513,9 +507,11 @@ export const calculateAttainment = async (courseId) => {
         clo_id: clo.id, clo_code: clo.code, description: clo.description,
         ncaaa_domain: clo.ncaaa_domain, bloom_level: clo.bloom_level,
         target_attainment: clo.target_attainment, passing_score: clo.passing_score,
+        so_mapping: clo.so_mapping, plo_mapping: clo.plo_mapping,
         total_students: students.length, students_passing: 0,
         attainment_percentage: 0, average_score: 0,
         status: 'Not Achieved', no_mapping: true, mapped_items: [],
+        student_item_scores: [],
       })
       continue
     }
@@ -524,6 +520,7 @@ export const calculateAttainment = async (courseId) => {
     let passing  = 0
     let pctSum   = 0
     let pctCount = 0
+    const studentItemScores = []
 
     for (const s of students) {
       let earned = 0
@@ -539,8 +536,9 @@ export const calculateAttainment = async (courseId) => {
         denom  += Number(it.full_mark) || 0
       }
       missingGradeCount += missingForStudent
-      if (denom > 0) {
-        const pct = (earned / denom) * 100
+      const pct = denom > 0 ? (earned / denom) * 100 : null
+      studentItemScores.push({ student_id: s.id, pct })
+      if (pct !== null) {
         pctSum += pct; pctCount++
         if (pct >= clo.passing_score) passing++
       }
@@ -556,6 +554,8 @@ export const calculateAttainment = async (courseId) => {
       bloom_level:           clo.bloom_level,
       target_attainment:     clo.target_attainment,
       passing_score:         clo.passing_score,
+      so_mapping:            clo.so_mapping,
+      plo_mapping:           clo.plo_mapping,
       total_students:        students.length,
       students_passing:      passing,
       attainment_percentage: Math.round(attainment * 100) / 100,
@@ -567,6 +567,7 @@ export const calculateAttainment = async (courseId) => {
         full_mark:       it.full_mark,
         assessment_name: assessById.get(it.assessment_id)?.name || '',
       })),
+      student_item_scores: studentItemScores,
     }
     cloResults.push(result)
 
@@ -612,6 +613,7 @@ export const calculateAttainment = async (courseId) => {
 
   return {
     data: {
+      course,
       course_id:            course.id,
       course_code:          course.code,
       course_name:          course.name,
@@ -620,6 +622,76 @@ export const calculateAttainment = async (courseId) => {
       overall_attainment:   Math.round(overall * 100) / 100,
       ncaaa_domain_summary: domainSummary,
       warnings,
+      assessments,
+      items,
     },
   }
+}
+
+// ── SO Attainment Notes ───────────────────────────────────────────────────────
+
+export const getSONotes = async (courseId) => {
+  const { data, error } = await supabase
+    .from('so_attainment_notes').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  return { data }
+}
+
+export const saveSONotes = async (courseId, soCode, reasons, improvementAction) => {
+  const { data, error } = await supabase
+    .from('so_attainment_notes')
+    .upsert(
+      { course_id: courseId, so_code: soCode, reasons, improvement_action: improvementAction },
+      { onConflict: 'course_id,so_code' }
+    )
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── SAQF Attainment Notes ─────────────────────────────────────────────────────
+
+export const getSAQFNotes = async (courseId) => {
+  const { data, error } = await supabase
+    .from('saqf_attainment_notes').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  return { data }
+}
+
+export const saveSAQFNote = async (courseId, domainCode, notes) => {
+  const { data, error } = await supabase
+    .from('saqf_attainment_notes')
+    .upsert(
+      { course_id: courseId, domain_code: domainCode, notes },
+      { onConflict: 'course_id,domain_code' }
+    )
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── CLO Recommendations ───────────────────────────────────────────────────────
+
+export const getCLORecommendations = async (courseId) => {
+  const { data, error } = await supabase
+    .from('clo_recommendations').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  return { data }
+}
+
+export const saveCLORecommendation = async (courseId, cloId, manualRecommendation) => {
+  const { data, error } = await supabase
+    .from('clo_recommendations')
+    .upsert(
+      {
+        course_id:              courseId,
+        clo_id:                 cloId,
+        manual_recommendation:  manualRecommendation,
+        updated_at:             new Date().toISOString(),
+      },
+      { onConflict: 'course_id,clo_id' }
+    )
+    .select().single()
+  if (error) raise(error)
+  return { data }
 }
