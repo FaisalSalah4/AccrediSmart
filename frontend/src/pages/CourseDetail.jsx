@@ -1053,7 +1053,7 @@ function StudentsTab({ courseId }) {
         const buf = await file.arrayBuffer()
         const wb  = XLSX.read(buf)
         const ws  = wb.Sheets[wb.SheetNames[0]]
-        rows2d = XLSX.utils.sheet_to_array(ws, { defval: '' })
+        rows2d = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
       } else if (ext === 'csv' || ext === 'txt') {
         const text = await file.text()
         rows2d = text.split('\n').map(line => line.split(/[,\t]/))
