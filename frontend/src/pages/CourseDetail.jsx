@@ -732,12 +732,15 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
 
   const addItem = async (e) => {
     e.preventDefault()
-    const err = validateItem(newItem.full_mark)
-    if (err) { setItemErrors({ new: err }); return }
+    const fmErr   = validateItem(newItem.full_mark)
+    const trimName = newItem.name.trim()
+    const dup      = items.find(it => it.name.trim().toLowerCase() === trimName.toLowerCase())
+    const nameErr  = dup ? `An item named '${trimName}' already exists in this assessment.` : ''
+    if (fmErr || nameErr) { setItemErrors({ new: fmErr, newName: nameErr }); return }
     setItemErrors({})
     setBusy(true)
     try {
-      await createAssessmentItem(assessment.id, { name: newItem.name, full_mark: Number(newItem.full_mark) })
+      await createAssessmentItem(assessment.id, { name: trimName, full_mark: Number(newItem.full_mark) })
       setNewItem({ name: '', full_mark: '' }); setAdding(false)
       onItemsChange()
     } catch (err2) { alert(err2.response?.data?.detail || 'Failed to add item') }
@@ -746,10 +749,13 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
 
   const startEditItem = (it) => { setEditingItemId(it.id); setEditItem({ name: it.name, full_mark: it.full_mark }); setItemErrors({}) }
   const saveEditItem  = async () => {
-    const err = validateItem(editItem.full_mark)
-    if (err) { setItemErrors({ edit: err }); return }
+    const fmErr    = validateItem(editItem.full_mark)
+    const trimName = editItem.name.trim()
+    const dup      = items.find(it => it.id !== editingItemId && it.name.trim().toLowerCase() === trimName.toLowerCase())
+    const nameErr  = dup ? `An item named '${trimName}' already exists in this assessment.` : ''
+    if (fmErr || nameErr) { setItemErrors({ edit: fmErr, editName: nameErr }); return }
     setBusy(true)
-    try { await updateAssessmentItem(editingItemId, { name: editItem.name, full_mark: Number(editItem.full_mark) }); setEditingItemId(null); onItemsChange() }
+    try { await updateAssessmentItem(editingItemId, { name: trimName, full_mark: Number(editItem.full_mark) }); setEditingItemId(null); onItemsChange() }
     catch (err2) { alert(err2.response?.data?.detail || 'Update failed') }
     finally { setBusy(false) }
   }
@@ -796,8 +802,9 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
           <form onSubmit={addItem} className="flex flex-wrap items-end gap-2 mb-2 p-2 bg-gray-50 rounded-lg">
             <div className="flex-1 min-w-[140px]">
               <label className="text-xs text-gray-500 block mb-0.5">Item Name</label>
-              <input required className="input text-sm" placeholder="Q1, Part A, …" value={newItem.name}
+              <input required className={`input text-sm ${itemErrors.newName ? 'border-red-300' : ''}`} placeholder="Q1, Part A, …" value={newItem.name}
                 onChange={e => setNewItem(v => ({ ...v, name: e.target.value }))} />
+              {itemErrors.newName && <p className="text-xs text-red-600">{itemErrors.newName}</p>}
             </div>
             <div className="w-28">
               <label className="text-xs text-gray-500 block mb-0.5">Full Mark (&gt;0)</label>
@@ -830,7 +837,8 @@ function AssessmentCard({ assessment, items, onEdit, onDelete, onItemsChange }) 
                   {editingItemId === it.id ? (
                     <>
                       <td className="py-1.5">
-                        <input className="input text-sm py-1" value={editItem.name} onChange={e => setEditItem(v => ({ ...v, name: e.target.value }))} />
+                        <input className={`input text-sm py-1 ${itemErrors.editName ? 'border-red-300' : ''}`} value={editItem.name} onChange={e => setEditItem(v => ({ ...v, name: e.target.value }))} />
+                        {itemErrors.editName && <p className="text-xs text-red-600">{itemErrors.editName}</p>}
                       </td>
                       <td className="py-1.5 text-right">
                         <div>
@@ -1283,11 +1291,9 @@ const DOMAIN_COLORS = {
   'Psychomotor Skills':                    '#ef4444',
 }
 
-function ReportTab({ courseId, evidenceCoveredCount, course }) {
-  const [report,    setReport]    = useState(null)
+function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, onReportGenerated }) {
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState('')
-  const [generated, setGenerated] = useState(false)
   const [cloRecs,   setCLORecs]   = useState({})   // clo_id → manual recommendation text
   const [savingRec, setSavingRec] = useState({})
 
@@ -1298,14 +1304,12 @@ function ReportTab({ courseId, evidenceCoveredCount, course }) {
         calculateAttainment(courseId),
         getCLORecommendations(courseId),
       ])
-      setReport(r.data)
+      onReportGenerated(r.data)
       const recsMap = {}
       for (const rec of (recs.data || [])) recsMap[rec.clo_id] = rec.manual_recommendation || ''
       setCLORecs(recsMap)
-      setGenerated(true)
     } catch (err2) {
       setError(err2.response?.data?.detail || 'Failed to generate report')
-      setReport(null)
     } finally { setLoading(false) }
   }
 
@@ -1949,6 +1953,8 @@ export default function CourseDetail() {
   const [loading,  setLoading]  = useState(true)
   const [activeTab, setActiveTab] = useState('overview')
   const [evidenceCovered, setEvidenceCovered] = useState(new Set())
+  const [attainmentReport,    setAttainmentReport]    = useState(null)
+  const [attainmentGenerated, setAttainmentGenerated] = useState(false)
 
   const allEvidenceComplete = evidenceCovered.size === EVIDENCE_TYPES.length
 
@@ -2035,7 +2041,17 @@ export default function CourseDetail() {
       {activeTab === 'students'    && allEvidenceComplete && <StudentsTab courseId={courseId} />}
 
       {activeTab === 'report'      && allEvidenceComplete && (
-        <ReportTab courseId={courseId} evidenceCoveredCount={evidenceCovered.size} course={course} />
+        <ReportTab
+          courseId={courseId}
+          evidenceCoveredCount={evidenceCovered.size}
+          course={course}
+          report={attainmentReport}
+          generated={attainmentGenerated}
+          onReportGenerated={(data) => {
+            setAttainmentReport(data)
+            setAttainmentGenerated(true)
+          }}
+        />
       )}
 
       {activeTab === 'abet'        && allEvidenceComplete && <ABETSOTab courseId={courseId} />}

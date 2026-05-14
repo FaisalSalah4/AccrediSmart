@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { GraduationCap } from 'lucide-react'
 import { DEPARTMENTS } from '../constants'
 
-const ROLES = ['faculty', 'admin', 'reviewer']
+const ROLES = ['faculty', 'admin']
 
 export default function Register() {
   const { signUp } = useAuth()
@@ -34,7 +34,7 @@ export default function Register() {
     e.preventDefault()
     setError('')
     if (needsDept && !form.department) {
-      setError('Department is required for faculty and reviewer roles.')
+      setError('Department is required for faculty roles.')
       return
     }
     setLoading(true)
