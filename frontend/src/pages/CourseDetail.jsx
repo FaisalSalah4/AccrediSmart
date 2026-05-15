@@ -192,6 +192,13 @@ function Alert({ type = 'info', children }) {
   )
 }
 
+function SaveIndicator({ status }) {
+  if (status === 'saving') return <span className="text-[10px] text-gray-400 ml-1">Saving…</span>
+  if (status === 'saved')  return <span className="text-[10px] text-green-600 ml-1">Saved ✓</span>
+  if (status === 'failed') return <span className="text-[10px] text-red-500 ml-1">Save failed</span>
+  return null
+}
+
 const fileSize = (bytes) => {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -1704,15 +1711,19 @@ function ABETSOTab({ courseId }) {
   useEffect(() => { load() }, [courseId])
 
   const saveNote = async (soCode, field, value) => {
+    const key = `${soCode}|${field}`
     setSONotes(prev => ({ ...prev, [soCode]: { ...(prev[soCode] || {}), [field]: value } }))
-    setSaving(prev => ({ ...prev, [soCode]: true }))
+    setSaving(prev => ({ ...prev, [key]: 'saving' }))
     try {
       const cur     = soNotes[soCode] || {}
       const reasons = field === 'reasons'            ? value : (cur.reasons            || '')
       const action  = field === 'improvement_action' ? value : (cur.improvement_action || '')
       await saveSONotes(courseId, soCode, reasons, action)
-    } catch (err) { console.error('Failed to save SO notes:', err) }
-    finally { setSaving(prev => ({ ...prev, [soCode]: false })) }
+      setSaving(prev => ({ ...prev, [key]: 'saved' }))
+      setTimeout(() => setSaving(prev => ({ ...prev, [key]: null })), 2000)
+    } catch {
+      setSaving(prev => ({ ...prev, [key]: 'failed' }))
+    }
   }
 
   if (loading) return <div className="card h-64 animate-pulse" />
@@ -1798,7 +1809,7 @@ function ABETSOTab({ courseId }) {
                       value={note.reasons}
                       onChange={e => setSONotes(prev => ({ ...prev, [so.code]: { ...prev[so.code], reasons: e.target.value } }))}
                       onBlur={e => saveNote(so.code, 'reasons', e.target.value)} />
-                    {saving[so.code] && <span className="text-[10px] text-gray-400">Saving…</span>}
+                    <SaveIndicator status={saving[`${so.code}|reasons`]} />
                   </td>
                   <td className="px-3 py-3 min-w-[130px]">
                     <textarea rows={2} className="input text-xs w-full"
@@ -1806,6 +1817,7 @@ function ABETSOTab({ courseId }) {
                       value={note.improvement_action}
                       onChange={e => setSONotes(prev => ({ ...prev, [so.code]: { ...prev[so.code], improvement_action: e.target.value } }))}
                       onBlur={e => saveNote(so.code, 'improvement_action', e.target.value)} />
+                    <SaveIndicator status={saving[`${so.code}|improvement_action`]} />
                   </td>
                 </tr>
               )
@@ -1844,10 +1856,14 @@ function SAQFTab({ courseId }) {
   useEffect(() => { load() }, [courseId])
 
   const saveNote = async (domainCode, value) => {
-    setSaving(prev => ({ ...prev, [domainCode]: true }))
-    try { await saveSAQFNote(courseId, domainCode, value) }
-    catch (err) { console.error('Failed to save SAQF note:', err) }
-    finally { setSaving(prev => ({ ...prev, [domainCode]: false })) }
+    setSaving(prev => ({ ...prev, [domainCode]: 'saving' }))
+    try {
+      await saveSAQFNote(courseId, domainCode, value)
+      setSaving(prev => ({ ...prev, [domainCode]: 'saved' }))
+      setTimeout(() => setSaving(prev => ({ ...prev, [domainCode]: null })), 2000)
+    } catch {
+      setSaving(prev => ({ ...prev, [domainCode]: 'failed' }))
+    }
   }
 
   if (loading) return <div className="card h-64 animate-pulse" />
@@ -1931,7 +1947,7 @@ function SAQFTab({ courseId }) {
                       value={notes}
                       onChange={e => setSAQFNotes(prev => ({ ...prev, [domain.code]: e.target.value }))}
                       onBlur={e => saveNote(domain.code, e.target.value)} />
-                    {saving[domain.code] && <span className="text-[10px] text-gray-400">Saving…</span>}
+                    <SaveIndicator status={saving[domain.code]} />
                   </td>
                 </tr>
               )
