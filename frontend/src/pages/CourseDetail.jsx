@@ -1721,7 +1721,8 @@ function ABETSOTab({ courseId }) {
       await saveSONotes(courseId, soCode, reasons, action)
       setSaving(prev => ({ ...prev, [key]: 'saved' }))
       setTimeout(() => setSaving(prev => ({ ...prev, [key]: null })), 2000)
-    } catch {
+    } catch (err) {
+      console.error('SO note save failed:', err?.response?.data?.detail || err)
       setSaving(prev => ({ ...prev, [key]: 'failed' }))
     }
   }
@@ -1861,7 +1862,8 @@ function SAQFTab({ courseId }) {
       await saveSAQFNote(courseId, domainCode, value)
       setSaving(prev => ({ ...prev, [domainCode]: 'saved' }))
       setTimeout(() => setSaving(prev => ({ ...prev, [domainCode]: null })), 2000)
-    } catch {
+    } catch (err) {
+      console.error('SAQF note save failed:', err?.response?.data?.detail || err)
       setSaving(prev => ({ ...prev, [domainCode]: 'failed' }))
     }
   }
