@@ -332,7 +332,7 @@ function EvidenceSection({ type, files, courseId, onRefresh }) {
           </div>
           <input
             ref={fileRef} type="file" multiple className="hidden"
-            accept={isTeachingMaterials ? '.zip' : '.pdf,.docx,.doc,.xlsx,.xls'}
+            accept={isTeachingMaterials ? '.zip' : '.pdf,.doc,.docx'}
             onChange={e => handleUpload(e.target.files)}
           />
         </div>

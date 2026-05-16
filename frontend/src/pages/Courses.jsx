@@ -329,7 +329,7 @@ function CourseModal({ onClose }) {
                         {templateCLOs.map(clo => (
                           <li key={clo.id} className="flex gap-2 text-xs">
                             <span className="font-mono font-semibold text-blue-700 shrink-0 w-10">{clo.code}</span>
-                            <span className="text-blue-600 line-clamp-1">{clo.description}</span>
+                            <span className="text-blue-600">{clo.description}</span>
                           </li>
                         ))}
                       </ul>
