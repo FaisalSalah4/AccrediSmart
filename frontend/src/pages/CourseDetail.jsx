@@ -27,6 +27,7 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, Cell,
 } from 'recharts'
+import html2canvas from 'html2canvas'
 
 // ── ABET / SAQF Official Mapping Constants ────────────────────────────────────
 
@@ -1303,6 +1304,8 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
   const [error,     setError]     = useState('')
   const [cloRecs,   setCLORecs]   = useState({})   // clo_id → manual recommendation text
   const [savingRec, setSavingRec] = useState({})
+  const [exporting, setExporting] = useState(false)
+  const chartRef = useRef()
 
   const handleGenerate = async () => {
     setLoading(true); setError('')
@@ -1329,10 +1332,22 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
 
   const handleExport = async () => {
     if (!report || !course) return
+    setExporting(true)
     try {
-      await exportFCARPDF({ course, report, cloRecsMap: cloRecs })
+      let chartImgData = null
+      if (chartRef.current) {
+        try {
+          const canvas = await html2canvas(chartRef.current, { scale: 2, useCORS: true, logging: false })
+          chartImgData = canvas.toDataURL('image/png')
+        } catch {
+          // graceful fallback: export without chart
+        }
+      }
+      await exportFCARPDF({ course, report, cloRecsMap: cloRecs, chartImgData })
     } catch (err2) {
       alert('PDF export failed: ' + (err2.message || 'Unknown error'))
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -1358,8 +1373,8 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
         </div>
         <div className="flex gap-2 flex-wrap">
           {generated && report && (
-            <button onClick={handleExport} className="btn-secondary flex items-center gap-2 text-sm">
-              <Download size={15} /> Export PDF
+            <button onClick={handleExport} disabled={exporting} className="btn-secondary flex items-center gap-2 text-sm">
+              <Download size={15} /> {exporting ? 'Generating…' : 'Export PDF'}
             </button>
           )}
           <button onClick={handleGenerate} disabled={loading} className="btn-primary flex items-center gap-2">
@@ -1401,7 +1416,7 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
           </div>
 
           {chartData.length > 0 && (
-            <div className="card">
+            <div className="card" ref={chartRef}>
               <h4 className="font-semibold text-gray-900 mb-4">Actual vs. Target Attainment</h4>
               <ResponsiveContainer width="100%" height={280}>
                 <BarChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
@@ -1537,7 +1552,7 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
 // PDF EXPORT
 // ════════════════════════════════════════════════════════════════════════════
 
-async function exportFCARPDF({ course, report, cloRecsMap }) {
+async function exportFCARPDF({ course, report, cloRecsMap, chartImgData }) {
   const doc = new jsPDF()
   const cloResults = report.clo_results || []
   const warnings   = report.warnings   || []
@@ -1592,11 +1607,46 @@ async function exportFCARPDF({ course, report, cloRecsMap }) {
     margin: { left: 14, right: 14 },
   })
 
+  // Chart: Actual vs. Target Attainment (between C and D)
+  let chartSectionEndY = doc.lastAutoTable.finalY
+  if (chartImgData) {
+    try {
+      const img = new Image()
+      await new Promise(resolve => { img.onload = resolve; img.onerror = resolve; img.src = chartImgData })
+      if (img.naturalWidth > 0) {
+        const pageW  = doc.internal.pageSize.getWidth()
+        const margin = 14
+        const maxW   = pageW - margin * 2
+        const scale  = maxW / img.naturalWidth
+        const imgH   = img.naturalHeight * scale
+        const labelY = chartSectionEndY + 10
+        const imgY   = labelY + 6
+        const endY   = imgY + imgH
+
+        if (endY > doc.internal.pageSize.getHeight() - 10) {
+          doc.addPage()
+          const y0 = 20
+          doc.setFontSize(11); doc.setFont(undefined, 'bold')
+          doc.text('Actual vs. Target Attainment', margin, y0)
+          doc.addImage(chartImgData, 'PNG', margin, y0 + 5, maxW, imgH)
+          chartSectionEndY = y0 + 5 + imgH
+        } else {
+          doc.setFontSize(11); doc.setFont(undefined, 'bold')
+          doc.text('Actual vs. Target Attainment', margin, labelY)
+          doc.addImage(chartImgData, 'PNG', margin, imgY, maxW, imgH)
+          chartSectionEndY = endY
+        }
+      }
+    } catch {
+      // chart embed failed; continue without it
+    }
+  }
+
   // D: CLO Attainment Results
   doc.setFontSize(13); doc.setFont(undefined, 'bold')
-  doc.text('D. CLO Attainment Results', 14, doc.lastAutoTable.finalY + 10)
+  doc.text('D. CLO Attainment Results', 14, chartSectionEndY + 10)
   autoTable(doc, {
-    startY: doc.lastAutoTable.finalY + 13,
+    startY: chartSectionEndY + 13,
     head: [['CLO', 'Attainment%', 'Target%', 'Status', 'Passed/Total', 'Auto-Recommendation', 'Faculty Input']],
     body: cloResults.map(r => {
       const autoRec = generateAutoRecommendation(r)
