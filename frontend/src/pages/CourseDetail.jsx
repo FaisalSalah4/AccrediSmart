@@ -16,6 +16,7 @@ import {
   getSONotes, saveSONotes,
   getSAQFNotes, saveSAQFNote,
   getCLORecommendations, saveCLORecommendation,
+  submitToWorkQueue, getDocumentComments, addDocumentComment,
 } from '../api'
 import { EVIDENCE_TYPES, ASSESSMENT_TYPES } from '../constants'
 import {
@@ -260,10 +261,12 @@ function OverviewTab({ course }) {
 // TAB: EVIDENCE FILES
 // ════════════════════════════════════════════════════════════════════════════
 
-function EvidenceSection({ type, files, courseId, onRefresh }) {
-  const [uploading, setUploading] = useState(false)
-  const [error, setError]         = useState('')
-  const fileRef                   = useRef()
+function EvidenceSection({ type, files, courseId, onRefresh, isAdmin, categoryIndex, comments, onCommentAdded }) {
+  const [uploading,     setUploading]     = useState(false)
+  const [error,         setError]         = useState('')
+  const [commentText,   setCommentText]   = useState('')
+  const [addingComment, setAddingComment] = useState(false)
+  const fileRef = useRef()
 
   const isTeachingMaterials = type.value === 'teaching_materials'
 
@@ -271,7 +274,6 @@ function EvidenceSection({ type, files, courseId, onRefresh }) {
     if (!inputFiles?.length) return
     setError('')
 
-    // Validate file types
     for (const file of Array.from(inputFiles)) {
       const ext = file.name.split('.').pop().toLowerCase()
       if (isTeachingMaterials && ext !== 'zip') {
@@ -295,6 +297,18 @@ function EvidenceSection({ type, files, courseId, onRefresh }) {
     if (!confirm('Delete this file?')) return
     try { await deleteDocument(docId); onRefresh() }
     catch { alert('Failed to delete file.') }
+  }
+
+  const handleAddComment = async () => {
+    if (!commentText.trim()) return
+    setAddingComment(true)
+    try {
+      const { data: newComment } = await addDocumentComment(courseId, categoryIndex, commentText.trim())
+      setCommentText('')
+      onCommentAdded(newComment)
+    } catch (err) {
+      console.error('Failed to add comment:', err)
+    } finally { setAddingComment(false) }
   }
 
   const hasFiles = files.length > 0
@@ -370,19 +384,68 @@ function EvidenceSection({ type, files, courseId, onRefresh }) {
           ))}
         </div>
       )}
+
+      {/* Admin comments */}
+      {(comments.length > 0 || isAdmin) && (
+        <div className="border-t border-gray-100 px-4 py-3 space-y-2 bg-amber-50/40">
+          {comments.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-xs font-semibold text-amber-700 uppercase tracking-wide">Admin Feedback</p>
+              {comments.map(c => (
+                <div key={c.id} className="bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-2 text-xs">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="font-semibold text-yellow-800">{c.admin_name}</span>
+                    <span className="text-yellow-600">{new Date(c.created_at).toLocaleString()}</span>
+                  </div>
+                  <p className="text-yellow-900">{c.comment}</p>
+                </div>
+              ))}
+            </div>
+          )}
+          {isAdmin && (
+            <div className="flex gap-2 pt-1">
+              <textarea
+                value={commentText}
+                onChange={e => setCommentText(e.target.value)}
+                placeholder="Add a comment for this evidence category…"
+                rows={2}
+                className="input text-xs flex-1"
+              />
+              <button
+                onClick={handleAddComment}
+                disabled={addingComment || !commentText.trim()}
+                className="btn-primary text-xs self-end px-3 py-1.5 h-fit"
+              >
+                {addingComment ? 'Adding…' : 'Add Comment'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
 
 function DocumentsTab({ courseId, onCoverageChange }) {
-  const [docs, setDocs]       = useState([])
-  const [loading, setLoading] = useState(true)
+  const { user }              = useAuth()
+  const [docs,     setDocs]     = useState([])
+  const [comments, setComments] = useState([])
+  const [loading,  setLoading]  = useState(true)
 
   const load = async () => {
-    const r = await getDocuments(courseId)
+    const [r, c] = await Promise.all([
+      getDocuments(courseId),
+      getDocumentComments(courseId),
+    ])
     setDocs(r.data)
+    setComments(c.data || [])
     const covered = new Set(r.data.map(d => d.document_type))
     onCoverageChange(covered)
+
+    if (covered.size === EVIDENCE_TYPES.length && user?.role === 'faculty') {
+      submitToWorkQueue(courseId).catch(console.error)
+    }
+
     setLoading(false)
   }
 
@@ -394,6 +457,10 @@ function DocumentsTab({ courseId, onCoverageChange }) {
 
   const coveredCount = EVIDENCE_TYPES.filter(t => docsByType[t.value].length > 0).length
   const allComplete  = coveredCount === EVIDENCE_TYPES.length
+
+  const handleCommentAdded = (newComment) => {
+    setComments(prev => [...prev, newComment])
+  }
 
   return (
     <div className="space-y-3 max-w-3xl">
@@ -427,8 +494,18 @@ function DocumentsTab({ courseId, onCoverageChange }) {
           {[1, 2, 3, 4].map(i => <div key={i} className="h-14 bg-white rounded-xl animate-pulse border border-gray-100" />)}
         </div>
       ) : (
-        EVIDENCE_TYPES.map(type => (
-          <EvidenceSection key={type.value} type={type} files={docsByType[type.value]} courseId={courseId} onRefresh={load} />
+        EVIDENCE_TYPES.map((type, idx) => (
+          <EvidenceSection
+            key={type.value}
+            type={type}
+            files={docsByType[type.value]}
+            courseId={courseId}
+            onRefresh={load}
+            isAdmin={user?.role === 'admin'}
+            categoryIndex={idx}
+            comments={comments.filter(c => c.category_index === idx)}
+            onCommentAdded={handleCommentAdded}
+          />
         ))
       )}
     </div>
@@ -1012,6 +1089,7 @@ function StudentsTab({ courseId }) {
   const [saving,      setSaving]      = useState(false)
   const [savedMsg,    setSavedMsg]    = useState('')
   const [gradeErrors, setGradeErrors] = useState({})
+  const [pasteMsg,    setPasteMsg]   = useState('')
 
   const [showAdd,    setShowAdd]    = useState(false)
   const [newStudent, setNewStudent] = useState({ student_id: '', name: '' })
@@ -1119,6 +1197,51 @@ function StudentsTab({ courseId }) {
     setGradeErrors(prev => { const n = { ...prev }; delete n[key]; return n })
   }
 
+  const handlePaste = (e, studentId, itemId, max) => {
+    e.preventDefault()
+    const text = e.clipboardData.getData('text')
+    const rawValues = text.split(/\r?\n/).map(v => v.trim()).filter(v => v !== '')
+    if (rawValues.length === 0) return
+
+    const studentIdx = students.findIndex(s => s.id === studentId)
+    if (studentIdx === -1) return
+
+    const updates  = []
+    const newGrades = { ...grades }
+    let filled = 0
+
+    for (let i = 0; i < rawValues.length; i++) {
+      const targetIdx = studentIdx + i
+      if (targetIdx >= students.length) break
+      const targetStudent = students[targetIdx]
+      const numVal = Number(rawValues[i].replace(',', '.'))
+      if (isNaN(numVal)) continue
+      const clamped = Math.min(max, Math.max(0, numVal))
+      newGrades[`${targetStudent.id}|${itemId}`] = String(clamped)
+      updates.push({ student_id: targetStudent.id, item_id: itemId, score: clamped })
+      filled++
+    }
+
+    setGrades(newGrades)
+    setGradeErrors(prev => {
+      const n = { ...prev }
+      for (const u of updates) delete n[`${u.student_id}|${u.item_id}`]
+      return n
+    })
+    setSavedMsg('')
+
+    if (updates.length > 0) {
+      setSaving(true)
+      saveItemGrades(courseId, updates)
+        .then(() => {
+          setSaving(false)
+          setPasteMsg(`Pasted ${filled} grade${filled !== 1 ? 's' : ''}`)
+          setTimeout(() => setPasteMsg(''), 2000)
+        })
+        .catch(() => { setSaving(false) })
+    }
+  }
+
   const saveAll = async () => {
     if (Object.keys(gradeErrors).length > 0) {
       alert('Fix grade errors before saving (scores cannot exceed item full mark).')
@@ -1224,7 +1347,8 @@ function StudentsTab({ courseId }) {
               {Object.keys(gradeErrors).length > 0 && (
                 <span className="text-xs text-red-600">{Object.keys(gradeErrors).length} error{Object.keys(gradeErrors).length > 1 ? 's' : ''} — fix before saving</span>
               )}
-              {savedMsg && <span className="text-xs text-green-600">{savedMsg}</span>}
+              {savedMsg  && <span className="text-xs text-green-600">{savedMsg}</span>}
+              {pasteMsg  && <span className="text-xs text-indigo-600 font-medium">{pasteMsg}</span>}
               <button onClick={saveAll} disabled={saving || Object.keys(gradeErrors).length > 0} className="btn-primary text-sm flex items-center gap-1">
                 <Save size={13} /> {saving ? 'Saving…' : 'Save All Grades'}
               </button>
@@ -1269,8 +1393,9 @@ function StudentsTab({ courseId }) {
                             type="number" min={0} max={max} step={0.1}
                             className={`w-16 text-sm text-right rounded border px-1.5 py-1 ${err2 ? 'border-red-300 bg-red-50' : 'border-gray-200'}`}
                             value={v}
-                            onChange={e => onCellChange(s.id, it.id, e.target.value, max)}
-                            onBlur={e  => onCellBlur(s.id,  it.id, e.target.value, max)}
+                            onChange={e  => onCellChange(s.id, it.id, e.target.value, max)}
+                            onBlur={e   => onCellBlur(s.id,  it.id, e.target.value, max)}
+                            onPaste={e  => handlePaste(e, s.id, it.id, max)}
                             title={err2 || undefined}
                           />
                         </td>

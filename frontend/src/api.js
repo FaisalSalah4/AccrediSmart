@@ -695,3 +695,119 @@ export const saveCLORecommendation = async (courseId, cloId, manualRecommendatio
   if (error) raise(error)
   return { data }
 }
+
+// ── Work Queue ────────────────────────────────────────────────────────────────
+
+export const submitToWorkQueue = async (courseId) => {
+  const id = await uid()
+  const { error } = await supabase
+    .from('work_queue')
+    .upsert(
+      { course_id: courseId, faculty_id: id, status: 'pending', submitted_at: new Date().toISOString() },
+      { onConflict: 'course_id', ignoreDuplicates: true }
+    )
+  if (error) raise(error)
+  return { data: { message: 'Submitted' } }
+}
+
+export const getWorkQueue = async () => {
+  const { data, error } = await supabase
+    .from('work_queue')
+    .select('*')
+    .order('submitted_at', { ascending: false })
+  if (error) raise(error)
+
+  if (!data || data.length === 0) return { data: [] }
+
+  const courseIds  = [...new Set(data.map(e => e.course_id).filter(Boolean))]
+  const facultyIds = [...new Set(data.map(e => e.faculty_id).filter(Boolean))]
+
+  const [coursesRes, profilesRes] = await Promise.all([
+    supabase.from('courses').select('id, code, name, semester, year').in('id', courseIds),
+    supabase.from('profiles').select('id, name').in('id', facultyIds),
+  ])
+
+  const courseMap  = Object.fromEntries((coursesRes.data  || []).map(c => [c.id, c]))
+  const profileMap = Object.fromEntries((profilesRes.data || []).map(p => [p.id, p]))
+
+  return {
+    data: data.map(entry => ({
+      ...entry,
+      course:  courseMap[entry.course_id],
+      faculty: profileMap[entry.faculty_id],
+    })),
+  }
+}
+
+export const updateWorkQueueStatus = async (id, status) => {
+  const reviewedBy = await uid()
+  const { data, error } = await supabase
+    .from('work_queue')
+    .update({ status, reviewed_at: new Date().toISOString(), reviewed_by: reviewedBy })
+    .eq('id', id)
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── Document Comments ─────────────────────────────────────────────────────────
+
+export const getDocumentComments = async (courseId) => {
+  const { data, error } = await supabase
+    .from('document_comments')
+    .select('*')
+    .eq('course_id', courseId)
+    .order('created_at', { ascending: true })
+  if (error) raise(error)
+
+  if (!data || data.length === 0) return { data: [] }
+
+  const adminIds = [...new Set(data.map(c => c.admin_id).filter(Boolean))]
+  const { data: profiles } = await supabase
+    .from('profiles').select('id, name').in('id', adminIds)
+  const profileMap = Object.fromEntries((profiles || []).map(p => [p.id, p]))
+
+  return {
+    data: data.map(c => ({ ...c, admin_name: profileMap[c.admin_id]?.name || 'Admin' })),
+  }
+}
+
+export const addDocumentComment = async (courseId, categoryIndex, comment) => {
+  const currentUid = await uid()
+  const { data, error } = await supabase
+    .from('document_comments')
+    .insert({ course_id: courseId, category_index: categoryIndex, admin_id: currentUid, comment })
+    .select('*').single()
+  if (error) raise(error)
+
+  const { data: profile } = await supabase
+    .from('profiles').select('name').eq('id', currentUid).single()
+  return { data: { ...data, admin_name: profile?.name || 'Admin' } }
+}
+
+// ── Admin: All Profiles ───────────────────────────────────────────────────────
+
+export const getAllProfiles = async () => {
+  const { data, error } = await supabase
+    .from('profiles').select('id, name, role, department').order('name')
+  if (error) raise(error)
+  return { data }
+}
+
+// ── Admin: Course Document Coverage ──────────────────────────────────────────
+
+export const getCourseDocumentCoverage = async (courseIds) => {
+  if (!courseIds || courseIds.length === 0) return {}
+  const { data, error } = await supabase
+    .from('documents').select('course_id, document_type').in('course_id', courseIds)
+  if (error) raise(error)
+
+  const coverage = {}
+  for (const doc of (data || [])) {
+    if (!coverage[doc.course_id]) coverage[doc.course_id] = new Set()
+    coverage[doc.course_id].add(doc.document_type)
+  }
+  const result = {}
+  for (const [id, types] of Object.entries(coverage)) result[id] = types.size
+  return result
+}
