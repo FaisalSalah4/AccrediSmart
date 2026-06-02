@@ -2,10 +2,11 @@ import { useState } from 'react'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import {
-  LayoutDashboard, BookOpen, LogOut, GraduationCap, Menu, X
+  LayoutDashboard, BookOpen, LogOut, GraduationCap, Menu, X,
+  ShieldCheck, Inbox,
 } from 'lucide-react'
 
-const nav = [
+const baseNav = [
   { to: '/',        label: 'Dashboard', icon: LayoutDashboard },
   { to: '/courses', label: 'Courses',   icon: BookOpen },
 ]
@@ -20,7 +21,14 @@ export default function Layout() {
     navigate('/login')
   }
 
-  const SidebarContent = () => (
+  const SidebarContent = () => {
+    const adminNav = user?.role === 'admin' ? [
+      { to: '/admin/courses', label: 'All Courses', icon: ShieldCheck },
+      { to: '/admin/queue',   label: 'Work Queue',  icon: Inbox },
+    ] : []
+    const allNav = [...baseNav, ...adminNav]
+
+    return (
     <>
       {/* Logo */}
       <div className="flex items-center gap-3 px-6 py-5 border-b border-indigo-800">
@@ -35,7 +43,7 @@ export default function Layout() {
 
       {/* Navigation */}
       <nav className="flex-1 px-3 py-4 space-y-1">
-        {nav.map(({ to, label, icon: Icon }) => (
+        {allNav.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
             to={to}
@@ -76,6 +84,7 @@ export default function Layout() {
       </div>
     </>
   )
+  }
 
   return (
     <div className="flex h-screen bg-gray-50 overflow-hidden">
