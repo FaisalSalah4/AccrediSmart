@@ -288,9 +288,6 @@ function EvidenceSection({ type, files, courseId, onRefresh, isAdmin, categoryIn
   const handleUpload = async (inputFiles) => {
     if (!inputFiles?.length) return
     setError('')
-
-    for (const file of Array.from(inputFiles)) {
-
     setUploading(true)
     try {
       for (const file of Array.from(inputFiles)) {
