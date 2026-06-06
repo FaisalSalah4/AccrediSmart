@@ -811,3 +811,139 @@ export const getCourseDocumentCoverage = async (courseIds) => {
   for (const [id, types] of Object.entries(coverage)) result[id] = types.size
   return result
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// FCAR v2 — DB-driven PLO / SO / SAQF reference + per-course attainment
+// (Tables defined in supabase_fcar_v2_schema.sql)
+// ════════════════════════════════════════════════════════════════════════════
+
+export const getProgramOutcomes = async (department) => {
+  const { data, error } = await supabase
+    .from('program_outcomes').select('*').eq('department', department).order('position')
+  if (error) raise(error)
+  return { data }
+}
+
+export const getStudentOutcomes = async (department) => {
+  const { data, error } = await supabase
+    .from('student_outcomes').select('*').eq('department', department).order('position')
+  if (error) raise(error)
+  return { data }
+}
+
+export const getSAQFDomains = async () => {
+  const { data, error } = await supabase
+    .from('saqf_domains').select('*').order('position')
+  if (error) raise(error)
+  return { data }
+}
+
+// ── CLO Recommendations (v2: auto_text + manual_text columns) ────────────────
+
+export const getCloRecommendations = async (courseId) => {
+  const { data, error } = await supabase
+    .from('clo_recommendations').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  const byClo = {}
+  for (const r of (data || [])) byClo[r.clo_id] = r
+  return { data: byClo }
+}
+
+export const upsertCloRecommendation = async (courseId, cloId, payload) => {
+  const id = await uid()
+  const row = {
+    course_id:   courseId,
+    clo_id:      cloId,
+    auto_text:   payload.auto_text   ?? null,
+    manual_text: payload.manual_text ?? null,
+    updated_by:  id,
+    updated_at:  new Date().toISOString(),
+  }
+  const { data, error } = await supabase
+    .from('clo_recommendations')
+    .upsert(row, { onConflict: 'course_id,clo_id' })
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── ABET SO Attainments (per course × SO, v2 table: so_attainments) ──────────
+
+export const getSOAttainments = async (courseId) => {
+  const { data, error } = await supabase
+    .from('so_attainments').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  const byCode = {}
+  for (const r of (data || [])) byCode[r.so_code] = r
+  return { data: byCode }
+}
+
+export const upsertSOAttainment = async (courseId, soCode, payload) => {
+  const id = await uid()
+  const row = {
+    course_id:          courseId,
+    so_code:            soCode,
+    reasons:            payload.reasons            ?? null,
+    improvement_action: payload.improvement_action ?? null,
+    updated_by:         id,
+    updated_at:         new Date().toISOString(),
+  }
+  const { data, error } = await supabase
+    .from('so_attainments')
+    .upsert(row, { onConflict: 'course_id,so_code' })
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── SAQF / NCAAA Attainments (per course × domain, v2 table: saqf_attainments)
+
+export const getSAQFAttainments = async (courseId) => {
+  const { data, error } = await supabase
+    .from('saqf_attainments').select('*').eq('course_id', courseId)
+  if (error) raise(error)
+  const byCode = {}
+  for (const r of (data || [])) byCode[r.domain_code] = r
+  return { data: byCode }
+}
+
+export const upsertSAQFAttainment = async (courseId, domainCode, payload) => {
+  const id = await uid()
+  const row = {
+    course_id:          courseId,
+    domain_code:        domainCode,
+    reasons:            payload.reasons            ?? null,
+    improvement_action: payload.improvement_action ?? null,
+    updated_by:         id,
+    updated_at:         new Date().toISOString(),
+  }
+  const { data, error } = await supabase
+    .from('saqf_attainments')
+    .upsert(row, { onConflict: 'course_id,domain_code' })
+    .select().single()
+  if (error) raise(error)
+  return { data }
+}
+
+// ── AI Recommendation (via Supabase Edge Function, local dev fallback) ────────
+
+export const generateAiRecommendation = async (courseId, report) => {
+  const { data, error } = await supabase.functions.invoke('generate-recommendation', {
+    body: { courseId, report },
+  })
+  if (!error) return { data }
+
+  const localUrl = import.meta.env.VITE_LOCAL_AI_URL || 'http://localhost:8787/generate-recommendation'
+  try {
+    const localRes = await fetch(localUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ courseId, report }),
+    })
+    const localData = await localRes.json().catch(() => ({}))
+    if (!localRes.ok) throw new Error(localData.error || 'Local AI server failed')
+    return { data: localData }
+  } catch {
+    raise(error)
+  }
+}

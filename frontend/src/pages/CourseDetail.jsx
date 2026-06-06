@@ -1,7 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
-import * as XLSX from 'xlsx'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import {
@@ -13,16 +12,24 @@ import {
   getCloItemMap, setCloItemMap,
   getItemGrades, saveItemGrades,
   calculateAttainment,
+  getProgramOutcomes, getStudentOutcomes, getSAQFDomains,
+  generateAiRecommendation,
+  getCloRecommendations, upsertCloRecommendation,
+  getSOAttainments, upsertSOAttainment,
+  getSAQFAttainments, upsertSAQFAttainment,
+  getCLORecommendations, saveCLORecommendation,
   getSONotes, saveSONotes,
   getSAQFNotes, saveSAQFNote,
-  getCLORecommendations, saveCLORecommendation,
   submitToWorkQueue, getDocumentComments, addDocumentComment,
 } from '../api'
 import { EVIDENCE_TYPES, ASSESSMENT_TYPES } from '../constants'
+import { recommendationFor, saqfRecommendationFor } from '../lib/recommendations'
+import { exportFcarReport } from '../lib/exportReport'
 import {
   Upload, FileText, Trash2, Download, X, Edit2, Save,
   BarChart3, BookOpen, Target, AlertCircle, CheckCircle, Lock,
   Users, ClipboardList, Link2, Plus, TrendingUp, Globe,
+  Award, Layers, Sparkles,
 } from 'lucide-react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -31,6 +38,14 @@ import {
 import html2canvas from 'html2canvas'
 
 // ── ABET / SAQF Official Mapping Constants ────────────────────────────────────
+
+const NCAAA_TO_SAQF = {
+  'Knowledge':                              'knowledge_understanding',
+  'Cognitive Skills':                       'cognitive_skills',
+  'Interpersonal Skills & Responsibility':  'autonomy_responsibility',
+  'Communication, IT & Numerical Skills':   'communication_ict',
+  'Psychomotor Skills':                     'practical_physical',
+}
 
 const SO_DEFINITIONS = [
   { code: 'SO.1', plo: 'PLO2', saqf: 'CS',  label: 'SO.1 / PLO2', description: 'Cognitive Skills — Apply analytical and critical thinking to solve complex engineering problems.' },
@@ -524,35 +539,60 @@ const DOMAIN_BADGE = {
   'Psychomotor Skills':                     'bg-rose-100 text-rose-700',
 }
 
-function CLOsTab({ courseId }) {
+function CLOsTab({ courseId, course }) {
   const { user }  = useAuth()
   const isAdmin   = user?.role === 'admin'
 
   const [clos, setClos]               = useState([])
+  const [plos, setPlos]               = useState([])
+  const [sos,  setSos]                = useState([])
   const [loading, setLoading]         = useState(true)
   const [editingId, setEditingId]     = useState(null)
   const [editValues, setEditValues]   = useState({})
   const [saving, setSaving]           = useState(false)
   const [saveError, setSaveError]     = useState('')
 
-  const load = () =>
-    getCLOs(courseId).then(r => setClos(r.data)).finally(() => setLoading(false))
+  const load = async () => {
+    setLoading(true)
+    try {
+      const [cRes, pRes, sRes] = await Promise.all([
+        getCLOs(courseId),
+        course?.department ? getProgramOutcomes(course.department) : Promise.resolve({ data: [] }),
+        course?.department ? getStudentOutcomes(course.department) : Promise.resolve({ data: [] }),
+      ])
+      setClos(cRes.data || [])
+      setPlos(pRes.data || [])
+      setSos(sRes.data  || [])
+    } finally {
+      setLoading(false)
+    }
+  }
 
-  useEffect(() => { load() }, [courseId])
+  useEffect(() => { load() }, [courseId, course?.department])
 
   const startEdit = (clo) => {
     setSaveError('')
     setEditingId(clo.id)
-    setEditValues({ target_attainment: clo.target_attainment, passing_score: clo.passing_score })
+    setEditValues({
+      target_attainment: clo.target_attainment,
+      passing_score:     clo.passing_score,
+      plo_mapping:       clo.plo_mapping || '',
+      so_mapping:        clo.so_mapping  || '',
+    })
   }
 
   const handleSave = async (cloId) => {
     setSaving(true); setSaveError('')
     try {
-      await updateCLO(cloId, {
-        target_attainment: Math.min(90, Math.max(60, Number(editValues.target_attainment))),
-        passing_score:     Math.min(80, Math.max(50, Number(editValues.passing_score))),
-      })
+      const payload = {
+        plo_mapping: editValues.plo_mapping || null,
+        so_mapping:  editValues.so_mapping  || null,
+      }
+      if (isAdmin) {
+        payload.target_attainment = Math.min(90, Math.max(60, Number(editValues.target_attainment)))
+        payload.passing_score     = Math.min(80, Math.max(50, Number(editValues.passing_score)))
+      }
+      await updateCLO(cloId, payload)
       setEditingId(null)
       load()
     } catch (err) {
@@ -563,9 +603,10 @@ function CLOsTab({ courseId }) {
   return (
     <div className="space-y-4 max-w-4xl">
       <Alert type="info">
-        CLOs are pre-populated based on department standards.{' '}
+        CLOs are pre-populated based on department standards. PLO and SO mappings can be
+        adjusted by faculty.{' '}
         {isAdmin
-          ? <>You may adjust the <strong>Target Attainment</strong> (60–90%) and <strong>Passing Score</strong> (50–80%).</>
+          ? <>You may also adjust <strong>Target Attainment</strong> (60–90%) and <strong>Passing Score</strong> (50–80%).</>
           : <><Lock size={12} className="inline" /> Target Attainment and Passing Score can only be adjusted by administrators.</>
         }
       </Alert>
@@ -597,16 +638,52 @@ function CLOsTab({ courseId }) {
                     <div className="space-y-2">
                       <div className="flex items-end gap-3 flex-wrap">
                         <div>
-                          <label className="text-xs text-gray-500 block mb-1">Target Attainment % <span className="text-gray-400">(60–90)</span></label>
-                          <input type="number" min={60} max={90} className="input w-24 text-sm"
+                          <label className="text-xs text-gray-500 block mb-1">
+                            Target Attainment % <span className="text-gray-400">(60–90)</span>
+                            {!isAdmin && <Lock size={10} className="inline ml-1 text-gray-300" />}
+                          </label>
+                          <input type="number" min={60} max={90} className="input w-24 text-sm disabled:bg-gray-50 disabled:text-gray-400"
                             value={editValues.target_attainment}
+                            disabled={!isAdmin}
                             onChange={e => setEditValues(v => ({ ...v, target_attainment: e.target.value }))} />
                         </div>
                         <div>
-                          <label className="text-xs text-gray-500 block mb-1">Passing Score % <span className="text-gray-400">(50–80)</span></label>
-                          <input type="number" min={50} max={80} className="input w-24 text-sm"
+                          <label className="text-xs text-gray-500 block mb-1">
+                            Passing Score % <span className="text-gray-400">(50–80)</span>
+                            {!isAdmin && <Lock size={10} className="inline ml-1 text-gray-300" />}
+                          </label>
+                          <input type="number" min={50} max={80} className="input w-24 text-sm disabled:bg-gray-50 disabled:text-gray-400"
                             value={editValues.passing_score}
+                            disabled={!isAdmin}
                             onChange={e => setEditValues(v => ({ ...v, passing_score: e.target.value }))} />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">PLO</label>
+                          <select
+                            className="input w-32 text-sm"
+                            value={editValues.plo_mapping || ''}
+                            onChange={e => setEditValues(v => ({ ...v, plo_mapping: e.target.value }))}
+                          >
+                            <option value="">—</option>
+                            {plos.map(p => (
+                              <option key={p.id} value={p.code} title={p.description}>{p.code}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">SO</label>
+                          <select
+                            className="input w-32 text-sm"
+                            value={editValues.so_mapping || ''}
+                            onChange={e => setEditValues(v => ({ ...v, so_mapping: e.target.value }))}
+                          >
+                            <option value="">—</option>
+                            {sos.map(s => (
+                              <option key={s.id} value={s.code} title={s.description}>
+                                {s.code}{s.related_plo ? ` (↔ ${s.related_plo})` : ''}
+                              </option>
+                            ))}
+                          </select>
                         </div>
                         <div className="flex gap-2">
                           <button onClick={() => handleSave(clo.id)} disabled={saving} className="btn-primary text-xs flex items-center gap-1">
@@ -1425,24 +1502,38 @@ const DOMAIN_COLORS = {
 }
 
 function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, onReportGenerated }) {
-  const [loading,   setLoading]   = useState(false)
-  const [error,     setError]     = useState('')
-  const [cloRecs,   setCLORecs]   = useState({})   // clo_id → manual recommendation text
-  const [savingRec, setSavingRec] = useState({})
-  const [exporting, setExporting] = useState(false)
+  const [loading,     setLoading]     = useState(false)
+  const [error,       setError]       = useState('')
+  const [cloRecs,     setCLORecs]     = useState({})
+  const [savingRec,   setSavingRec]   = useState({})
+  const [exporting,   setExporting]   = useState(false)
+  const [aiDraft,     setAiDraft]     = useState('')
+  const [aiGenerated, setAiGenerated] = useState(false)
+  const [aiLoading,   setAiLoading]   = useState(false)
+  const [aiEditing,   setAiEditing]   = useState(false)
+  const [aiNotice,    setAiNotice]    = useState('')
   const chartRef = useRef()
 
   const handleGenerate = async () => {
     setLoading(true); setError('')
     try {
-      const [r, recs] = await Promise.all([
-        calculateAttainment(courseId),
-        getCLORecommendations(courseId),
-      ])
+      const r = await calculateAttainment(courseId)
       onReportGenerated(r.data)
-      const recsMap = {}
-      for (const rec of (recs.data || [])) recsMap[rec.clo_id] = rec.manual_recommendation || ''
-      setCLORecs(recsMap)
+      setAiDraft(''); setAiGenerated(false); setAiEditing(false); setAiNotice('')
+      // Try new clo_recommendations table first, fall back to old table gracefully
+      try {
+        const recs = await getCloRecommendations(courseId)
+        setCLORecs(recs.data || {})
+      } catch {
+        try {
+          const recs = await getCLORecommendations(courseId)
+          const recsMap = {}
+          for (const rec of (recs.data || [])) recsMap[rec.clo_id] = rec.manual_recommendation || ''
+          setCLORecs(recsMap)
+        } catch {
+          setCLORecs({})
+        }
+      }
     } catch (err2) {
       setError(err2.response?.data?.detail || 'Failed to generate report')
     } finally { setLoading(false) }
@@ -1450,9 +1541,67 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
 
   const handleSaveRec = async (cloId, text) => {
     setSavingRec(prev => ({ ...prev, [cloId]: true }))
-    try { await saveCLORecommendation(courseId, cloId, text) }
-    catch (err2) { console.error('Save recommendation failed:', err2) }
-    finally { setSavingRec(prev => ({ ...prev, [cloId]: false })) }
+    try {
+      await upsertCloRecommendation(courseId, cloId, {
+        manual_text: text,
+        auto_text: recommendationFor(report?.clo_results?.find(r => r.clo_id === cloId) || {}),
+      })
+    } catch {
+      try { await saveCLORecommendation(courseId, cloId, text) } catch (err2) { console.error('Save recommendation failed:', err2) }
+    } finally { setSavingRec(prev => ({ ...prev, [cloId]: false })) }
+  }
+
+  const handleAiRecommendation = async () => {
+    if (!report) return
+    setAiLoading(true)
+    try {
+      const ai = await generateAiRecommendation(courseId, report)
+      setAiDraft(ai.data?.recommendation || buildAiRecommendationDraft(report))
+      setAiNotice(`Generated with ${ai.data?.provider || 'AI'}${ai.data?.model ? ` (${ai.data.model})` : ''}.`)
+      setAiGenerated(true)
+      setAiEditing(false)
+    } catch (err2) {
+      console.warn('AI function unavailable; using local draft generator.', err2)
+      setAiDraft(buildAiRecommendationDraft(report))
+      setAiNotice('')
+      setAiGenerated(true)
+      setAiEditing(false)
+    } finally {
+      setAiLoading(false)
+    }
+  }
+
+  const handleExportXlsx = async () => {
+    if (!report) return
+    setExporting(true)
+    try {
+      const [courseData, clos, assess, items, soAttain, saqfAttain] = await Promise.all([
+        getCourse(courseId).then(r => r.data),
+        getCLOs(courseId).then(r => r.data),
+        getAssessments(courseId).then(r => r.data),
+        getAssessmentItems(courseId).then(r => r.data),
+        getSOAttainments(courseId).then(r => r.data || {}).catch(() => ({})),
+        getSAQFAttainments(courseId).then(r => r.data || {}).catch(() => ({})),
+      ])
+      const mappingRes = await getCloItemMap(courseId)
+      const mapping = mappingRes.data || []
+      const snapshot = { ...cloRecs }
+      for (const r of report.clo_results || []) {
+        snapshot[r.clo_id] = {
+          ...(snapshot[r.clo_id] || {}),
+          auto_text:   recommendationFor(r),
+          manual_text: typeof cloRecs[r.clo_id] === 'object' ? (cloRecs[r.clo_id]?.manual_text || '') : (cloRecs[r.clo_id] || ''),
+        }
+      }
+      await exportFcarReport({
+        course: courseData, clos, assessments: assess, items, mapping,
+        report, soAttain, saqfAttain, cloRecs: snapshot,
+      })
+    } catch (err2) {
+      alert(err2.response?.data?.detail || err2.message || 'Export failed')
+    } finally {
+      setExporting(false)
+    }
   }
 
   const handleExport = async () => {
@@ -1498,9 +1647,14 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
         </div>
         <div className="flex gap-2 flex-wrap">
           {generated && report && (
-            <button onClick={handleExport} disabled={exporting} className="btn-secondary flex items-center gap-2 text-sm">
-              <Download size={15} /> {exporting ? 'Generating…' : 'Export PDF'}
-            </button>
+            <>
+              <button onClick={handleExportXlsx} disabled={exporting} className="btn-secondary flex items-center gap-2 text-sm" title="Download FCAR .xlsx workbook">
+                <Download size={15} /> {exporting ? 'Exporting…' : 'Export XLSX'}
+              </button>
+              <button onClick={handleExport} disabled={exporting} className="btn-secondary flex items-center gap-2 text-sm">
+                <Download size={15} /> {exporting ? 'Generating…' : 'Export PDF'}
+              </button>
+            </>
           )}
           <button onClick={handleGenerate} disabled={loading} className="btn-primary flex items-center gap-2">
             <BarChart3 size={16} />
@@ -1667,6 +1821,66 @@ function ReportTab({ courseId, evidenceCoveredCount, course, report, generated, 
               </div>
             </div>
           )}
+
+          {/* AI Recommendation */}
+          <div className="card border-indigo-100 bg-indigo-50/40">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <h4 className="font-semibold text-gray-900 flex items-center gap-2">
+                  <Sparkles size={16} className="text-indigo-600" />
+                  AI Recommendation
+                </h4>
+                <p className="text-xs text-gray-500 mt-1">
+                  Generated from the current FCAR attainment results, CLO status, domain coverage, and calculation warnings.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {aiGenerated && (
+                  <button
+                    onClick={() => setAiEditing(v => !v)}
+                    className="btn-secondary text-sm flex items-center gap-2"
+                  >
+                    {aiEditing ? <CheckCircle size={14} /> : <Edit2 size={14} />}
+                    {aiEditing ? 'Done Editing' : 'Edit Recommendation'}
+                  </button>
+                )}
+                <button
+                  onClick={handleAiRecommendation}
+                  disabled={aiLoading}
+                  className="btn-primary text-sm flex items-center gap-2 disabled:opacity-50"
+                >
+                  <Sparkles size={14} />
+                  {aiLoading ? 'Generating...' : aiGenerated ? 'Refresh AI Recommendation' : 'Generate AI Recommendation'}
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-4 border border-amber-200 bg-amber-50 text-amber-800 rounded-lg px-3 py-2 text-xs">
+              AI-generated recommendations must be reviewed by the instructor before use in accreditation documentation.
+            </div>
+
+            {aiNotice && (
+              <div className="mt-2 text-xs text-indigo-700">{aiNotice}</div>
+            )}
+
+            {aiGenerated && (
+              <div className="mt-4">
+                <label className="text-xs text-gray-500 block mb-1">Recommendation Output</label>
+                {aiEditing ? (
+                  <textarea
+                    rows={18}
+                    className="input text-sm leading-6"
+                    value={aiDraft}
+                    onChange={e => setAiDraft(e.target.value)}
+                  />
+                ) : (
+                  <div className="bg-white border border-gray-200 rounded-lg px-4 py-3 text-sm leading-6 whitespace-pre-wrap text-gray-800 max-h-[460px] overflow-y-auto">
+                    {aiDraft}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </>
       )}
     </div>
@@ -1861,143 +2075,176 @@ async function exportFCARPDF({ course, report, cloRecsMap, chartImgData }) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // TAB: ABET SO ATTAINMENT
+// Rolls up CLO results by clos.so_mapping into per-SO attainment. Reasons and
+// Improvement Action are persisted in the so_attainments table (v2 schema).
 // ════════════════════════════════════════════════════════════════════════════
 
-function ABETSOTab({ courseId }) {
-  const [report,   setReport]   = useState(null)
-  const [soNotes,  setSONotes]  = useState({})
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState('')
-  const [saving,   setSaving]   = useState({})
+function abetVector(avg) {
+  if (avg >= 80) return { code: 'E', label: 'Excellent',      cls: 'bg-green-100 text-green-700'  }
+  if (avg >= 70) return { code: 'A', label: 'Adequate',       cls: 'bg-blue-100 text-blue-700'    }
+  if (avg >= 60) return { code: 'M', label: 'Minimal',        cls: 'bg-amber-100 text-amber-700'  }
+  return            { code: 'U', label: 'Unsatisfactory',     cls: 'bg-red-100 text-red-700'      }
+}
+
+function ABETSOTab({ courseId, course }) {
+  const [report,  setReport]  = useState(null)
+  const [clos,    setClos]    = useState([])
+  const [sos,     setSos]     = useState([])
+  const [stored,  setStored]  = useState({})
+  const [drafts,  setDrafts]  = useState({})
+  const [loading, setLoading] = useState(true)
+  const [saving,  setSaving]  = useState(null)
 
   const load = async () => {
-    setLoading(true); setError('')
+    setLoading(true)
     try {
-      const [r, n] = await Promise.all([calculateAttainment(courseId), getSONotes(courseId)])
-      setReport(r.data)
-      const nm = {}
-      for (const note of (n.data || [])) nm[note.so_code] = { reasons: note.reasons || '', improvement_action: note.improvement_action || '' }
-      setSONotes(nm)
-    } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to load data. Make sure students and grades are entered.')
-    } finally { setLoading(false) }
+      const [rep, c, s, st] = await Promise.all([
+        calculateAttainment(courseId),
+        getCLOs(courseId),
+        course?.department ? getStudentOutcomes(course.department) : Promise.resolve({ data: [] }),
+        getSOAttainments(courseId).catch(() => ({ data: {} })),
+      ])
+      setReport(rep.data)
+      setClos(c.data || [])
+      setSos(s.data || [])
+      setStored(st.data || {})
+    } finally {
+      setLoading(false)
+    }
   }
 
-  useEffect(() => { load() }, [courseId])
+  useEffect(() => { load() }, [courseId, course?.department])
 
-  const saveNote = async (soCode, field, value) => {
-    const key = `${soCode}|${field}`
-    setSONotes(prev => ({ ...prev, [soCode]: { ...(prev[soCode] || {}), [field]: value } }))
-    setSaving(prev => ({ ...prev, [key]: 'saving' }))
+  const aggregates = useMemo(() => {
+    const cloById = new Map(clos.map(c => [c.id, c]))
+    const map = new Map()
+    for (const r of (report?.clo_results || [])) {
+      if (r.no_mapping) continue
+      const c = cloById.get(r.clo_id); if (!c) continue
+      const codes = (c.so_mapping || '').split(/[,;\s]+/).filter(Boolean)
+      for (const so of codes) {
+        if (!map.has(so)) map.set(so, { actuals: [], met: 0, total: 0, targets: [] })
+        const e = map.get(so)
+        e.actuals.push(r.attainment_percentage)
+        e.targets.push(r.target_attainment)
+        e.total++
+        if (r.status === 'Achieved') e.met++
+      }
+    }
+    return map
+  }, [report, clos])
+
+  const saveQual = async (soCode) => {
+    setSaving(soCode)
     try {
-      const cur     = soNotes[soCode] || {}
-      const reasons = field === 'reasons'            ? value : (cur.reasons            || '')
-      const action  = field === 'improvement_action' ? value : (cur.improvement_action || '')
-      await saveSONotes(courseId, soCode, reasons, action)
-      setSaving(prev => ({ ...prev, [key]: 'saved' }))
-      setTimeout(() => setSaving(prev => ({ ...prev, [key]: null })), 2000)
+      const draft = drafts[soCode] || {}
+      await upsertSOAttainment(courseId, soCode, {
+        reasons:            draft.reasons            ?? stored[soCode]?.reasons            ?? '',
+        improvement_action: draft.improvement_action ?? stored[soCode]?.improvement_action ?? '',
+      })
+      const fresh = await getSOAttainments(courseId)
+      setStored(fresh.data || {})
+      setDrafts(prev => { const n = { ...prev }; delete n[soCode]; return n })
     } catch (err) {
-      console.error('SO note save failed:', err?.response?.data?.detail || err)
-      setSaving(prev => ({ ...prev, [key]: 'failed' }))
+      alert(err.response?.data?.detail || 'Save failed')
+    } finally {
+      setSaving(null)
     }
   }
 
   if (loading) return <div className="card h-64 animate-pulse" />
-  if (error) return (
-    <div className="space-y-4">
-      <Alert type="error">{error}</Alert>
-      <button onClick={load} className="btn-secondary text-sm">Retry</button>
-    </div>
-  )
-  if (!report) return null
 
-  const cloResults = report.clo_results || []
+  const seen    = new Set([...aggregates.keys()])
+  const refRows = sos.filter(s => !seen.has(s.code))
+  const aggRows = [...aggregates.entries()]
 
   return (
     <div className="space-y-4 max-w-6xl">
       <Alert type="info">
-        SO Attainment is computed from CLO data. Each CLO's <strong>so_mapping</strong> field drives the SO grouping.
-        The SO→PLO→SAQF mapping follows the official FCAR workbook standard. Notes auto-save on blur.
+        ABET Student Outcomes are rolled up from CLO attainment via the SO column on
+        each CLO. Add Reasons and an Improvement Action per SO — both persist in the
+        exported FCAR report.
       </Alert>
 
       <div className="card overflow-x-auto p-0">
-        <table className="w-full text-xs">
+        <table className="w-full text-sm">
           <thead className="bg-gray-50">
             <tr>
-              {['SO / PLO', 'SAQF Domain', 'CLOs Involved', 'SO Attainment', 'Met?', '>70% Students', 'Perf. Vector', 'Reasons', 'Improvement Action'].map(h => (
-                <th key={h} className="text-left px-3 py-3 text-xs font-medium text-gray-500 whitespace-nowrap border-r border-gray-100 last:border-r-0">{h}</th>
+              {['SO', 'Related PLO', 'Avg Attainment %', '% CLOs Met', 'Vector', 'Status', 'Reasons', 'Improvement Action', ''].map(h => (
+                <th key={h} className="text-left px-3 py-2 text-xs font-medium text-gray-500 whitespace-nowrap">{h}</th>
               ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100">
-            {SO_DEFINITIONS.map(so => {
-              const mappedCLOs = cloResults.filter(r => normalizeSO(r.so_mapping) === so.code)
-              const note = soNotes[so.code] || { reasons: '', improvement_action: '' }
+          <tbody className="divide-y divide-gray-50">
+            {aggRows.length === 0 && refRows.length === 0 && (
+              <tr><td colSpan={9} className="px-4 py-6 text-center text-sm text-gray-400">
+                No SO mappings found on any CLO. Set the SO column on the CLOs tab first.
+              </td></tr>
+            )}
 
-              if (mappedCLOs.length === 0) {
-                return (
-                  <tr key={so.code} className="hover:bg-gray-50/50">
-                    <td className="px-3 py-3 font-semibold text-indigo-700 whitespace-nowrap">{so.label}</td>
-                    <td className="px-3 py-3 text-gray-500">{SAQF_DOMAIN_LABELS[so.saqf]}</td>
-                    <td colSpan={7} className="px-3 py-3 text-gray-400 italic">NOT APPLICABLE — No CLOs mapped to this SO</td>
-                  </tr>
-                )
-              }
-
-              const validCLOs = mappedCLOs.filter(r => !r.no_mapping)
-              const attAvg    = validCLOs.length > 0 ? validCLOs.reduce((s, r) => s + r.attainment_percentage, 0) / validCLOs.length : 0
-              const met       = attAvg >= 70
-              const pctOver70 = validCLOs.length > 0
-                ? validCLOs.reduce((s, r) => s + ((r.total_students > 0 ? r.students_passing / r.total_students : 0) * 100), 0) / validCLOs.length
-                : 0
-              const vec = computeSOVector(mappedCLOs)
-
+            {aggRows.map(([so, e]) => {
+              const avg    = e.actuals.length ? e.actuals.reduce((a, b) => a + b, 0) / e.actuals.length : 0
+              const target = e.targets.length ? e.targets.reduce((a, b) => a + b, 0) / e.targets.length : 70
+              const pctMet = e.total ? (e.met / e.total) * 100 : 0
+              const v      = abetVector(avg)
+              const met    = avg >= target
+              const refSO  = sos.find(x => x.code === so)
+              const draft  = drafts[so] || {}
+              const data   = stored[so] || {}
+              const reasons = draft.reasons            ?? data.reasons            ?? ''
+              const improve = draft.improvement_action ?? data.improvement_action ?? ''
               return (
-                <tr key={so.code} className="hover:bg-gray-50/50">
-                  <td className="px-3 py-3">
-                    <div className="font-semibold text-indigo-700 whitespace-nowrap">{so.label}</div>
-                    <div className="text-gray-400 max-w-[130px] truncate" title={so.description}>{so.description.slice(0, 45)}…</div>
+                <tr key={so} className="align-top">
+                  <td className="px-3 py-2 font-bold text-indigo-700 whitespace-nowrap">{so}</td>
+                  <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{refSO?.related_plo || '—'}</td>
+                  <td className="px-3 py-2 font-semibold">{fmt(avg)}%</td>
+                  <td className="px-3 py-2 text-gray-600">{fmt(pctMet)}%</td>
+                  <td className="px-3 py-2">
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${v.cls}`} title={v.label}>
+                      {v.code} — {v.label}
+                    </span>
                   </td>
-                  <td className="px-3 py-3 font-medium text-gray-600 whitespace-nowrap">{SAQF_DOMAIN_LABELS[so.saqf]}</td>
-                  <td className="px-3 py-3">
-                    <div className="flex flex-wrap gap-1">
-                      {mappedCLOs.map(r => <span key={r.clo_id} className="bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded">{r.clo_code}</span>)}
-                    </div>
-                  </td>
-                  <td className={`px-3 py-3 font-semibold text-sm whitespace-nowrap ${met ? 'text-green-600' : 'text-red-600'}`}>
-                    {attAvg.toFixed(1)}%
-                  </td>
-                  <td className="px-3 py-3 whitespace-nowrap">
-                    <span className={`px-2 py-0.5 rounded-full font-medium ${met ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                  <td className="px-3 py-2">
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${met ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
                       {met ? 'Met' : 'Not Met'}
                     </span>
                   </td>
-                  <td className="px-3 py-3 font-medium text-gray-700 whitespace-nowrap">{pctOver70.toFixed(1)}%</td>
-                  <td className="px-3 py-3 whitespace-nowrap">
-                    <span className="text-emerald-700 font-medium">E:{vec.E}</span>{' '}
-                    <span className="text-blue-700 font-medium">A:{vec.A}</span>{' '}
-                    <span className="text-amber-700 font-medium">M:{vec.M}</span>{' '}
-                    <span className="text-red-700 font-medium">U:{vec.U}</span>
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-48"
+                      value={reasons}
+                      placeholder="Why did this SO meet / miss the target?"
+                      onChange={e => setDrafts(p => ({ ...p, [so]: { ...(p[so] || {}), reasons: e.target.value } }))}
+                    />
                   </td>
-                  <td className="px-3 py-3 min-w-[130px]">
-                    <textarea rows={2} className="input text-xs w-full"
-                      placeholder="Reasons for this result…"
-                      value={note.reasons}
-                      onChange={e => setSONotes(prev => ({ ...prev, [so.code]: { ...prev[so.code], reasons: e.target.value } }))}
-                      onBlur={e => saveNote(so.code, 'reasons', e.target.value)} />
-                    <SaveIndicator status={saving[`${so.code}|reasons`]} />
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-48"
+                      value={improve}
+                      placeholder="Action plan for next offering."
+                      onChange={e => setDrafts(p => ({ ...p, [so]: { ...(p[so] || {}), improvement_action: e.target.value } }))}
+                    />
                   </td>
-                  <td className="px-3 py-3 min-w-[130px]">
-                    <textarea rows={2} className="input text-xs w-full"
-                      placeholder="Improvement action…"
-                      value={note.improvement_action}
-                      onChange={e => setSONotes(prev => ({ ...prev, [so.code]: { ...prev[so.code], improvement_action: e.target.value } }))}
-                      onBlur={e => saveNote(so.code, 'improvement_action', e.target.value)} />
-                    <SaveIndicator status={saving[`${so.code}|improvement_action`]} />
+                  <td className="px-3 py-2">
+                    <button
+                      onClick={() => saveQual(so)}
+                      disabled={saving === so}
+                      className="btn-primary text-xs flex items-center gap-1"
+                    >
+                      <Save size={11} /> {saving === so ? '…' : 'Save'}
+                    </button>
                   </td>
                 </tr>
               )
             })}
+
+            {refRows.map(s => (
+              <tr key={s.code} className="bg-gray-50/40">
+                <td className="px-3 py-2 font-bold text-gray-500">{s.code}</td>
+                <td className="px-3 py-2 text-gray-500">{s.related_plo || '—'}</td>
+                <td colSpan={7} className="px-3 py-2 text-xs text-gray-500 italic">
+                  No CLO mapped to this SO yet — add the SO code to a CLO on the CLOs tab to start tracking it.
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
@@ -2007,124 +2254,131 @@ function ABETSOTab({ courseId }) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // TAB: SAQF / NCAAA ATTAINMENT
+// Aggregates CLO attainment by SAQF domain via clos.ncaaa_domain column.
+// Domain list is loaded from the saqf_domains table (v2 schema).
 // ════════════════════════════════════════════════════════════════════════════
 
+function saqfStatus(avg) {
+  if (avg >= 70) return { code: 'D',  label: 'Demonstrated',           cls: 'bg-green-100 text-green-700' }
+  if (avg >= 60) return { code: 'PD', label: 'Partially Demonstrated', cls: 'bg-amber-100 text-amber-700' }
+  return            { code: 'ND', label: 'Not Demonstrated',           cls: 'bg-red-100 text-red-700'     }
+}
+
 function SAQFTab({ courseId }) {
-  const [report,    setReport]    = useState(null)
-  const [saqfNotes, setSAQFNotes] = useState({})
-  const [loading,   setLoading]   = useState(true)
-  const [error,     setError]     = useState('')
-  const [saving,    setSaving]    = useState({})
+  const [report,  setReport]  = useState(null)
+  const [domains, setDomains] = useState([])
+  const [stored,  setStored]  = useState({})
+  const [drafts,  setDrafts]  = useState({})
+  const [loading, setLoading] = useState(true)
+  const [saving,  setSaving]  = useState(null)
 
   const load = async () => {
-    setLoading(true); setError('')
+    setLoading(true)
     try {
-      const [r, n] = await Promise.all([calculateAttainment(courseId), getSAQFNotes(courseId)])
-      setReport(r.data)
-      const nm = {}
-      for (const note of (n.data || [])) nm[note.domain_code] = note.notes || ''
-      setSAQFNotes(nm)
-    } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to load data. Make sure students and grades are entered.')
+      const [rep, d, st] = await Promise.all([
+        calculateAttainment(courseId),
+        getSAQFDomains().catch(() => ({ data: [] })),
+        getSAQFAttainments(courseId).catch(() => ({ data: {} })),
+      ])
+      setReport(rep.data)
+      setDomains(d.data || [])
+      setStored(st.data || {})
     } finally { setLoading(false) }
   }
 
   useEffect(() => { load() }, [courseId])
 
-  const saveNote = async (domainCode, value) => {
-    setSaving(prev => ({ ...prev, [domainCode]: 'saving' }))
+  const aggregates = useMemo(() => {
+    const map = {}
+    for (const r of (report?.clo_results || [])) {
+      if (r.no_mapping) continue
+      const code = NCAAA_TO_SAQF[r.ncaaa_domain]
+      if (!code) continue
+      if (!map[code]) map[code] = { actuals: [] }
+      map[code].actuals.push(r.attainment_percentage)
+    }
+    return map
+  }, [report])
+
+  const saveQual = async (domainCode) => {
+    setSaving(domainCode)
     try {
-      await saveSAQFNote(courseId, domainCode, value)
-      setSaving(prev => ({ ...prev, [domainCode]: 'saved' }))
-      setTimeout(() => setSaving(prev => ({ ...prev, [domainCode]: null })), 2000)
+      const draft = drafts[domainCode] || {}
+      await upsertSAQFAttainment(courseId, domainCode, {
+        reasons:            draft.reasons            ?? stored[domainCode]?.reasons            ?? '',
+        improvement_action: draft.improvement_action ?? stored[domainCode]?.improvement_action ?? '',
+      })
+      const fresh = await getSAQFAttainments(courseId)
+      setStored(fresh.data || {})
+      setDrafts(prev => { const n = { ...prev }; delete n[domainCode]; return n })
     } catch (err) {
-      console.error('SAQF note save failed:', err?.response?.data?.detail || err)
-      setSaving(prev => ({ ...prev, [domainCode]: 'failed' }))
+      alert(err.response?.data?.detail || 'Save failed')
+    } finally {
+      setSaving(null)
     }
   }
 
   if (loading) return <div className="card h-64 animate-pulse" />
-  if (error) return (
-    <div className="space-y-4">
-      <Alert type="error">{error}</Alert>
-      <button onClick={load} className="btn-secondary text-sm">Retry</button>
-    </div>
-  )
-  if (!report) return null
-
-  const cloResults = report.clo_results || []
 
   return (
     <div className="space-y-4 max-w-5xl">
       <Alert type="info">
-        SAQF domains are derived from the official SO→PLO→SAQF mapping from the FCAR workbook.
-        Each CLO's <strong>so_mapping</strong> determines which domain it contributes to.
-        Attainment thresholds: D ≥ 70%, PD 60–69%, ND &lt; 60%.
+        SAQF / NCAAA domains aggregate CLO attainment by the domain column on each CLO.
+        D ≥ 70% (Demonstrated) · 60–&lt;70% (Partially Demonstrated) · &lt;60% (Not Demonstrated).
       </Alert>
 
       <div className="card overflow-x-auto p-0">
         <table className="w-full text-sm">
           <thead className="bg-gray-50">
             <tr>
-              {['SAQF Domain', 'SOs Covered', 'CLOs Involved', 'Domain Attainment', 'Interpretation', 'Notes / Action'].map(h => (
-                <th key={h} className="text-left px-4 py-3 text-xs font-medium text-gray-500 whitespace-nowrap">{h}</th>
+              {['Domain', 'Avg Attainment %', 'Status', 'Auto-suggested Action', 'Reasons', 'Improvement Action', ''].map(h => (
+                <th key={h} className="text-left px-3 py-2 text-xs font-medium text-gray-500 whitespace-nowrap">{h}</th>
               ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100">
-            {SAQF_DOMAINS.map(domain => {
-              const domainCLOs = cloResults.filter(r => {
-                const so = normalizeSO(r.so_mapping)
-                return so && domain.soList.includes(so)
-              })
-              const notes = saqfNotes[domain.code] || ''
-
-              if (domainCLOs.length === 0) {
-                return (
-                  <tr key={domain.code} className="hover:bg-gray-50/50">
-                    <td className="px-4 py-3">
-                      <div className="font-semibold text-gray-800">{domain.label}</div>
-                      <div className="text-xs font-mono text-gray-400">{domain.code}</div>
-                    </td>
-                    <td className="px-4 py-3 text-xs text-gray-500">{domain.soList.join(', ')}</td>
-                    <td colSpan={4} className="px-4 py-3 text-gray-400 italic text-xs">NOT APPLICABLE — No CLOs mapped to this domain</td>
-                  </tr>
-                )
-              }
-
-              const valid  = domainCLOs.filter(r => !r.no_mapping)
-              const attAvg = valid.length > 0 ? valid.reduce((s, r) => s + r.attainment_percentage, 0) / valid.length : 0
-              const { label: interp, color: intColor } = attAvg >= 70
-                ? { label: 'D — Demonstrated',           color: 'bg-green-100 text-green-700' }
-                : attAvg >= 60
-                ? { label: 'PD — Partially Demonstrated', color: 'bg-amber-100 text-amber-700' }
-                : { label: 'ND — Not Demonstrated',       color: 'bg-red-100 text-red-700' }
-
+          <tbody className="divide-y divide-gray-50">
+            {domains.map(d => {
+              const arr   = (aggregates[d.code]?.actuals) || []
+              const has   = arr.length > 0
+              const avg   = has ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+              const stat  = has ? saqfStatus(avg) : null
+              const draft = drafts[d.code] || {}
+              const data  = stored[d.code] || {}
+              const reasons = draft.reasons            ?? data.reasons            ?? ''
+              const improve = draft.improvement_action ?? data.improvement_action ?? ''
+              const hint  = has ? saqfRecommendationFor({ avg, label: d.label, code: d.code, status: stat.code }) : ''
               return (
-                <tr key={domain.code} className="hover:bg-gray-50/50">
-                  <td className="px-4 py-3">
-                    <div className="font-semibold text-gray-800 text-sm">{domain.label}</div>
-                    <div className="text-xs font-mono text-gray-400">{domain.code}</div>
+                <tr key={d.code} className="align-top">
+                  <td className="px-3 py-2 font-semibold text-gray-800 whitespace-nowrap">{d.label}</td>
+                  <td className="px-3 py-2">{has ? `${fmt(avg)}%` : '—'}</td>
+                  <td className="px-3 py-2">
+                    {stat
+                      ? <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${stat.cls}`}>{stat.code} — {stat.label}</span>
+                      : <span className="text-xs text-gray-400 italic">no CLOs in this domain</span>}
                   </td>
-                  <td className="px-4 py-3 text-xs text-gray-500">{domain.soList.join(', ')}</td>
-                  <td className="px-4 py-3">
-                    <div className="flex flex-wrap gap-1">
-                      {domainCLOs.map(r => <span key={r.clo_id} className="text-xs bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded">{r.clo_code}</span>)}
-                    </div>
+                  <td className="px-3 py-2 text-xs text-gray-600 max-w-[260px]">{hint || '—'}</td>
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-48"
+                      value={reasons}
+                      placeholder="Why did this domain perform this way?"
+                      onChange={e => setDrafts(p => ({ ...p, [d.code]: { ...(p[d.code] || {}), reasons: e.target.value } }))}
+                    />
                   </td>
-                  <td className={`px-4 py-3 font-semibold text-sm whitespace-nowrap ${attAvg >= 70 ? 'text-green-600' : attAvg >= 60 ? 'text-amber-600' : 'text-red-600'}`}>
-                    {valid.length > 0 ? `${attAvg.toFixed(1)}%` : '—'}
+                  <td className="px-3 py-2">
+                    <textarea rows={2} className="input text-xs w-48"
+                      value={improve}
+                      placeholder="What you will change next term."
+                      onChange={e => setDrafts(p => ({ ...p, [d.code]: { ...(p[d.code] || {}), improvement_action: e.target.value } }))}
+                    />
                   </td>
-                  <td className="px-4 py-3">
-                    <span className={`text-xs px-2 py-1 rounded-full font-medium ${intColor}`}>{interp}</span>
-                  </td>
-                  <td className="px-4 py-3 min-w-[200px]">
-                    <textarea rows={2} className="input text-xs w-full"
-                      placeholder="Notes and action plan…"
-                      value={notes}
-                      onChange={e => setSAQFNotes(prev => ({ ...prev, [domain.code]: e.target.value }))}
-                      onBlur={e => saveNote(domain.code, e.target.value)} />
-                    <SaveIndicator status={saving[domain.code]} />
+                  <td className="px-3 py-2">
+                    <button
+                      onClick={() => saveQual(d.code)}
+                      disabled={saving === d.code}
+                      className="btn-primary text-xs flex items-center gap-1"
+                    >
+                      <Save size={11} /> {saving === d.code ? '…' : 'Save'}
+                    </button>
                   </td>
                 </tr>
               )
@@ -2225,7 +2479,7 @@ export default function CourseDetail() {
         <DocumentsTab courseId={courseId} onCoverageChange={setEvidenceCovered} />
       )}
 
-      {activeTab === 'clos'        && allEvidenceComplete && <CLOsTab courseId={courseId} />}
+      {activeTab === 'clos'        && allEvidenceComplete && <CLOsTab courseId={courseId} course={course} />}
 
       {activeTab === 'assessments' && allEvidenceComplete && <AssessmentsTab courseId={courseId} />}
 
@@ -2247,7 +2501,7 @@ export default function CourseDetail() {
         />
       )}
 
-      {activeTab === 'abet'        && allEvidenceComplete && <ABETSOTab courseId={courseId} />}
+      {activeTab === 'abet'        && allEvidenceComplete && <ABETSOTab courseId={courseId} course={course} />}
 
       {activeTab === 'saqf'        && allEvidenceComplete && <SAQFTab courseId={courseId} />}
     </div>
