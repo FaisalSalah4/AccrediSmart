@@ -290,12 +290,6 @@ function EvidenceSection({ type, files, courseId, onRefresh, isAdmin, categoryIn
     setError('')
 
     for (const file of Array.from(inputFiles)) {
-      const ext = file.name.split('.').pop().toLowerCase()
-      if (isTeachingMaterials && ext !== 'zip') {
-        setError('Only ZIP files are accepted for Copies of Teaching Materials')
-        return
-      }
-    }
 
     setUploading(true)
     try {
@@ -357,12 +351,12 @@ function EvidenceSection({ type, files, courseId, onRefresh, isAdmin, categoryIn
               {uploading ? 'Uploading…' : 'Upload'}
             </button>
             {isTeachingMaterials && (
-              <span className="text-[10px] text-gray-400">ZIP files only</span>
+              <span className="text-[10px] text-gray-400">All file types accepted</span>
             )}
           </div>
           <input
             ref={fileRef} type="file" multiple className="hidden"
-            accept={isTeachingMaterials ? '.zip' : '.pdf,.doc,.docx'}
+            accept={isTeachingMaterials ? '*' : '.pdf,.doc,.docx'}
             onChange={e => handleUpload(e.target.files)}
           />
         </div>
